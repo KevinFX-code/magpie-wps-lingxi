@@ -1,4 +1,5 @@
 *.tgz
+publish.bat
 node_modules/
 *.log
 .env
