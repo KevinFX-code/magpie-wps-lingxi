@@ -7,7 +7,7 @@
   "exports": "./index.mjs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/KevinFX-code/magpie-wps-lingxi.git"
+    "url": "git+https://github.com/KevinFX-code/magpie-wps-lingxi.git"
   },
   "files": [
     "index.mjs",
