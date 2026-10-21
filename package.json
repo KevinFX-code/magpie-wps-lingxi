@@ -1,0 +1,25 @@
+{
+  "name": "magpie-wps-lingxi",
+  "version": "1.0.0",
+  "description": "Magpie provider plugin for WPS Lingxi (WPS 灵犀 / Lingxi Claw): daily check-in, usage balance query, and OpenAI-compatible reverse proxy",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "wps",
+    "lingxi",
+    "kdocs",
+    "wps-ai"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "maxConcurrency": 4
+  }
+}
