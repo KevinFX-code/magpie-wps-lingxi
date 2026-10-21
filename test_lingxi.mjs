@@ -29,7 +29,7 @@ const fakeGetAuth = async () => ({
 
 async function run() {
   console.log("=== 1. 查询可用模型 ===")
-  const models = await plugin.provider.models(plugin.provider)
+  const models = await plugin.provider.models(plugin.provider, { auth: await fakeGetAuth() })
   const list = Object.values(models)
   console.log(`共支持 ${list.length} 个模型:`)
   for (const m of list) {
@@ -45,13 +45,14 @@ async function run() {
   console.log("签到结果:", JSON.stringify(checkinResult, null, 2))
 
   console.log("\n=== 4. 测试反代对话 (Chat Completion) ===")
-  const customFetch = await plugin.auth.loader(fakeGetAuth)
+  const loaderOpts = await plugin.auth.loader(fakeGetAuth)
+  const customFetch = loaderOpts.fetch
   try {
     const res = await customFetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "lingxi-auto",
+        model: "deepseek-v4.1-flash",
         messages: [{ role: "user", content: "请用一句话介绍你自己" }],
         stream: false,
       }),
@@ -60,7 +61,7 @@ async function run() {
     const json = await res.json()
     console.log("模型回复:", JSON.stringify(json, null, 2))
   } catch (e) {
-    console.log("对话测试异常 (可能需要特定模型权限或会话创建):", e.message)
+    console.log("对话测试异常:", e.message)
   }
 }
 

@@ -299,62 +299,137 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
       async loader(getAuth) {
         let activeSessionId = ""
 
-        return async function customFetch(url, init = {}) {
-          const auth = await getAuth()
-          const cookie = resolveCookie(auth)
+        return {
+          baseURL: `${LINGXI_BASE}/api`,
+          apiKey: "placeholder",
+          async fetch(input, init = {}) {
+            const auth = await getAuth()
+            const cookie = resolveCookie(auth)
 
-          if (url.includes("/chat/completions")) {
             let body = {}
             try {
-              body = JSON.parse(init.body || "{}")
+              let rawBody = init?.body
+              if (rawBody === undefined && input instanceof Request) {
+                rawBody = await input.clone().text()
+              }
+              if (typeof rawBody === "string") {
+                body = JSON.parse(rawBody)
+              } else if (rawBody) {
+                body = JSON.parse(new TextDecoder().decode(rawBody))
+              }
             } catch {}
 
             const messages = body.messages || []
             const stream = body.stream !== false
-            const requestedModel = (body.model || "deepseek-v4.1-flash").replace(/^wps-lingxi\//, "")
+            let requestedModel = (body.model || "deepseek-v4.1-flash")
+              .replace(/^wps-lingxi\//, "")
+              .replace(/^lingxi-/, "")
 
-            const lastUserMsg = [...messages].reverse().find((m) => m.role === "user")
-            const question = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg?.content || "")
+            if (!requestedModel || requestedModel === "default") {
+              requestedModel = "deepseek-v4.1-flash"
+            }
 
-            // 自动确保有可用 session_id
+            // 提取提问内容，支持多轮对话上下文整合
+            let question = ""
+            if (messages.length === 1) {
+              question = typeof messages[0].content === "string" ? messages[0].content : JSON.stringify(messages[0].content)
+            } else if (messages.length > 1) {
+              const lastUser = [...messages].reverse().find((m) => m.role === "user")
+              const currentQ = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content || "")
+
+              const history = []
+              for (const m of messages) {
+                if (m === lastUser) break
+                const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content)
+                if (m.role === "system") {
+                  history.push(`[System: ${c}]`)
+                } else if (m.role === "user") {
+                  history.push(`User: ${c}`)
+                } else if (m.role === "assistant") {
+                  history.push(`Assistant: ${c}`)
+                }
+              }
+
+              if (history.length) {
+                question = `${history.join("\n\n")}\n\nUser: ${currentQ}`
+              } else {
+                question = currentQ
+              }
+            }
+
+            if (!question) {
+              question = "你好"
+            }
+
+            // 获取或创建 session_id
+            async function createSession() {
+              const sessRes = await fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions`, {
+                method: "POST",
+                headers: {
+                  Cookie: cookie,
+                  "Content-Type": "application/json",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  Referer: "https://lingxi.kdocs.cn/",
+                },
+                body: "{}",
+              })
+              const sessData = await sessRes.json()
+              return sessData?.data?.session_id || ""
+            }
+
             if (!activeSessionId) {
-              try {
-                const sessRes = await fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions`, {
-                  method: "POST",
-                  headers: {
-                    Cookie: cookie,
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    Referer: "https://lingxi.kdocs.cn/",
+              activeSessionId = await createSession()
+            }
+
+            // 发起请求到官方 completions 端点
+            async function sendCompletions(sessId) {
+              const payload = {
+                question,
+                model: requestedModel,
+                user_input: { text: question },
+              }
+
+              return fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions/${sessId}/completions`, {
+                method: "POST",
+                headers: {
+                  Cookie: cookie,
+                  "Content-Type": "application/json",
+                  "X-Cc-Version": "1",
+                  "X-Client-Type": "lingxi-web",
+                  "X-Cc-Entrance": "default",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  Referer: "https://lingxi.kdocs.cn/",
+                },
+                body: JSON.stringify(payload),
+              })
+            }
+
+            let upstreamRes = await sendCompletions(activeSessionId)
+            if (upstreamRes.status === 404 || upstreamRes.status === 400) {
+              activeSessionId = await createSession()
+              if (activeSessionId) {
+                upstreamRes = await sendCompletions(activeSessionId)
+              }
+            }
+
+            if (!upstreamRes.ok) {
+              const errText = await upstreamRes.text().catch(() => "")
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    message: `WPS 灵犀上游响应异常: HTTP ${upstreamRes.status} ${errText}`,
+                    type: "upstream_error",
+                    code: upstreamRes.status,
                   },
-                  body: "{}",
-                })
-                const sessData = await sessRes.json()
-                activeSessionId = sessData?.data?.session_id || ""
-              } catch {}
+                }),
+                {
+                  status: upstreamRes.status,
+                  headers: { "Content-Type": "application/json" },
+                }
+              )
             }
 
-            const payload = {
-              question,
-              model: requestedModel,
-              user_input: { text: question },
-            }
-
-            const completionsUrl = `${LINGXI_BASE}/api/aigc/v3/assistant/sessions/${activeSessionId}/completions`
-            const upstreamRes = await fetch(completionsUrl, {
-              method: "POST",
-              headers: {
-                Cookie: cookie,
-                "Content-Type": "application/json",
-                "X-Cc-Version": "1",
-                "X-Client-Type": "lingxi-web",
-                "X-Cc-Entrance": "default",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                Referer: "https://lingxi.kdocs.cn/",
-              },
-              body: JSON.stringify(payload),
-            })
-
+            // 流式转换器
             let lineBuffer = ""
             const streamTransform = new TransformStream({
               transform(chunk, controller) {
@@ -368,7 +443,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                     if (!raw) continue
                     try {
                       const item = JSON.parse(raw)
-                      // 思考过程 (Reasoning / Thinking)
+                      // 深度思考推理流 (Reasoning / Thinking)
                       if (item.type === "reasoning" && item.data) {
                         const reasoningText = typeof item.data === "object" ? item.data.text || "" : String(item.data)
                         const sseEvent = {
@@ -467,9 +542,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 Connection: "keep-alive",
               },
             })
-          }
-
-          return fetch(url, init)
+          },
         }
       },
 
