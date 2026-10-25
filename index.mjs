@@ -273,7 +273,10 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
           }
 
           const data = (await res.json())?.data || {}
-          const totalBalance = data.total_balance ?? data.balance ?? 0
+          const totalBalance = Number(data.total_balance ?? data.balance ?? 0)
+          const summary = data.bonus_summary || {}
+          const totalValue = Number(summary.total_value ?? 0)
+          const totalConsumed = Number(summary.total_consumed ?? 0)
 
           let earliestExpire = ""
           const bonuses = data.bonus_credits || data.bonus_summary?.items || []
@@ -285,10 +288,28 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             }
           }
 
+          // 路由页和额度面板要的是“窗口”（总额/剩余/已用/重置时间），
+          // 只给 balance 字符串会被当成“剩余额度未知”。
+          const windows = []
+          if (totalValue > 0) {
+            const usedPct = Math.max(0, Math.min(100, (totalConsumed / totalValue) * 100))
+            windows.push({
+              name: "智点",
+              used: usedPct,
+              remaining: totalBalance,
+              amount: totalBalance,
+              limit: totalValue,
+              display: `${totalBalance.toLocaleString()} / ${totalValue.toLocaleString()} 智点`,
+              unit: "智点",
+              ...(earliestExpire ? { resetsAt: earliestExpire, runsOutAt: earliestExpire } : {}),
+            })
+          }
+
           return {
             plan: "WPS 灵犀",
             user: auth.accountId || "WPS 账户",
             balance: `${totalBalance.toLocaleString()} 智点`,
+            windows,
             until: earliestExpire,
             signIn: "kept",
           }
@@ -299,7 +320,6 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
 
       // 3. 反代网关拦截器：自动维护会话并转发到官方 SSE Completions 接口
       async loader(getAuth) {
-        let activeSessionId = ""
 
         return {
           baseURL: `${LINGXI_BASE}/api`,
@@ -379,9 +399,8 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               return sessData?.data?.session_id || ""
             }
 
-            if (!activeSessionId) {
-              activeSessionId = await createSession()
-            }
+            // 灵犀同一 session 并发会返回 event:error：每个请求各建一个会话
+            let activeSessionId = await createSession()
 
             // 发起请求到官方 completions 端点
             async function sendCompletions(sessId) {
@@ -389,6 +408,11 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 question,
                 model: requestedModel,
                 user_input: { text: question },
+              }
+              // 把 magpie 客户端选择的思考档位透传给灵犀（上游定义 0/1/2）
+              const effort = body.reasoning_effort ?? body.reasoningEffort ?? body.thinking_level
+              if (effort !== undefined && effort !== null && effort !== "") {
+                payload.reasoning_effort = String(effort)
               }
 
               return fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions/${sessId}/completions`, {
@@ -433,6 +457,8 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
 
             // 流式转换器
             let lineBuffer = ""
+            let currentEvent = ""
+            let sawError = false
             const streamTransform = new TransformStream({
               transform(chunk, controller) {
                 lineBuffer += new TextDecoder().decode(chunk)
@@ -440,6 +466,14 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 lineBuffer = lines.pop() || ""
 
                 for (const line of lines) {
+                  if (line.startsWith("event:")) {
+                    currentEvent = line.slice(6).trim()
+                    if (currentEvent === "error" && !sawError) {
+                      sawError = true
+                      console.log("[wps-lingxi] upstream returned event:error (session concurrency or upstream fault)")
+                    }
+                    continue
+                  }
                   if (line.startsWith("data:")) {
                     const raw = line.slice(5).trim()
                     if (!raw) continue
@@ -519,6 +553,18 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 }
               }
 
+              if (!fullContent && sawError) {
+                return new Response(
+                  JSON.stringify({
+                    error: {
+                      message: "WPS Lingxi upstream returned event:error (likely same-session concurrency, retry)",
+                      type: "upstream_error",
+                      code: 502,
+                    },
+                  }),
+                  { status: 502, headers: { "Content-Type": "application/json" } }
+                )
+              }
               const openAiResponse = {
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion",
