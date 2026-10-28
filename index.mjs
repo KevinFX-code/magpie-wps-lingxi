@@ -272,8 +272,18 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             return { error: "登录态失效，请重新登录", signIn: "expired" }
           }
 
-          const data = (await res.json())?.data || {}
-          const totalBalance = data.total_balance ?? data.balance ?? 0
+          if (!res.ok) throw new Error(`Credit query failed: HTTP ${res.status}`)
+          const creditResult = await res.json()
+          if (!creditResult.data) throw new Error("Missing upstream credit data")
+          const data = creditResult.data
+          const totalBalance = Number(data.total_balance ?? data.balance ?? 0)
+          const summary = data.bonus_summary || {}
+          const totalValue = Number(summary.total_value ?? 0)
+          const totalConsumed = summary.total_consumed == null ? null : Number(summary.total_consumed)
+          if (![totalBalance, totalValue].every(Number.isFinite) || totalBalance < 0 || totalValue < 0 ||
+              (totalConsumed !== null && (!Number.isFinite(totalConsumed) || totalConsumed < 0))) {
+            throw new Error("Invalid upstream credit values")
+          }
 
           let earliestExpire = ""
           const bonuses = data.bonus_credits || data.bonus_summary?.items || []
@@ -285,10 +295,28 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             }
           }
 
+          // 路由页和额度面板要的是“窗口”（总额/剩余/已用/重置时间），
+          // 只给 balance 字符串会被当成“剩余额度未知”。
+          const windows = []
+          {
+            const usedPct = totalValue > 0 && totalConsumed !== null ? Math.max(0, Math.min(100, (totalConsumed / totalValue) * 100)) : null
+            windows.push({
+              name: "智点",
+              ...(usedPct !== null ? { used: usedPct } : {}),
+              remaining: totalBalance,
+              amount: totalBalance,
+              ...(totalValue > 0 ? { limit: totalValue } : {}),
+              display: totalValue > 0 ? `${totalBalance.toLocaleString()} / ${totalValue.toLocaleString()} 智点` : `${totalBalance.toLocaleString()} 智点`,
+              unit: "智点",
+              // Credit expiry is not a replenishment or total-balance exhaustion time.
+            })
+          }
+
           return {
             plan: "WPS 灵犀",
             user: auth.accountId || "WPS 账户",
             balance: `${totalBalance.toLocaleString()} 智点`,
+            windows,
             until: earliestExpire,
             signIn: "kept",
           }
@@ -299,7 +327,6 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
 
       // 3. 反代网关拦截器：自动维护会话并转发到官方 SSE Completions 接口
       async loader(getAuth) {
-        let activeSessionId = ""
 
         return {
           baseURL: `${LINGXI_BASE}/api`,
@@ -307,6 +334,12 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
           async fetch(input, init = {}) {
             const auth = await getAuth()
             const cookie = resolveCookie(auth)
+            const signal = init.signal ?? (input instanceof Request ? input.signal : undefined)
+            signal?.throwIfAborted()
+            const errorResponse = (message, status = 502, code = "upstream_error") => new Response(
+              JSON.stringify({ error: { message, type: "upstream_error", code } }),
+              { status, headers: { "Content-Type": "application/json" } }
+            )
 
             let body = {}
             try {
@@ -363,10 +396,20 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               question = "你好"
             }
 
+            // Normalize named client variants to the upstream 0/1/2 protocol.
+            const effort = body.reasoning_effort ?? body.reasoningEffort ?? body.thinking_level
+            const effortMap = { low: "0", high: "1", max: "2", "0": "0", "1": "1", "2": "2" }
+            const normalizedEffort = effort == null || effort === "" || !Object.hasOwn(effortMap, String(effort))
+              ? undefined : effortMap[String(effort)]
+            if (effort != null && effort !== "" && normalizedEffort === undefined) {
+              return errorResponse("Unsupported reasoning effort", 400, "invalid_reasoning_effort")
+            }
+
             // 获取或创建 session_id
             async function createSession() {
               const sessRes = await fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions`, {
                 method: "POST",
+                signal,
                 headers: {
                   Cookie: cookie,
                   "Content-Type": "application/json",
@@ -375,12 +418,23 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 },
                 body: "{}",
               })
+              if (!sessRes.ok) {
+                const error = new Error(`Session creation failed: HTTP ${sessRes.status}`)
+                error.status = sessRes.status
+                throw error
+              }
               const sessData = await sessRes.json()
-              return sessData?.data?.session_id || ""
+              const id = sessData?.data?.session_id
+              if (typeof id !== "string" || !id.trim()) throw new Error("Session creation returned no session ID")
+              return id
             }
 
-            if (!activeSessionId) {
-              activeSessionId = await createSession()
+            // 灵犀同一 session 并发会返回 event:error：每个请求各建一个会话
+            let activeSessionId
+            try { activeSessionId = await createSession() }
+            catch (error) {
+              signal?.throwIfAborted()
+              return errorResponse(error.message, error.status || 502)
             }
 
             // 发起请求到官方 completions 端点
@@ -390,9 +444,11 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 model: requestedModel,
                 user_input: { text: question },
               }
+              if (normalizedEffort !== undefined) payload.reasoning_effort = normalizedEffort
 
               return fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions/${sessId}/completions`, {
                 method: "POST",
+                signal,
                 headers: {
                   Cookie: cookie,
                   "Content-Type": "application/json",
@@ -406,13 +462,13 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               })
             }
 
-            let upstreamRes = await sendCompletions(activeSessionId)
-            if (upstreamRes.status === 404 || upstreamRes.status === 400) {
-              activeSessionId = await createSession()
-              if (activeSessionId) {
-                upstreamRes = await sendCompletions(activeSessionId)
-              }
+            let upstreamRes
+            try { upstreamRes = await sendCompletions(activeSessionId) }
+            catch (error) {
+              signal?.throwIfAborted()
+              return errorResponse("Unable to read WPS Lingxi upstream response")
             }
+
 
             if (!upstreamRes.ok) {
               const errText = await upstreamRes.text().catch(() => "")
@@ -430,74 +486,74 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 }
               )
             }
+            if (!upstreamRes.body) return errorResponse("WPS Lingxi upstream returned no response body")
 
-            // 流式转换器
-            let lineBuffer = ""
+            // Parse SSE frames independently of network and UTF-8 chunk boundaries.
+            const decoder = new TextDecoder()
+            const encoder = new TextEncoder()
+            const completionId = `chatcmpl-${Date.now()}`
+            let lineBuffer = "", eventName = "", dataLines = []
+            let sawError = false, ended = false
+            let upstreamError = { message: "Upstream stream ended without a completion marker", type: "upstream_error", code: "incomplete_stream" }
+            function emit(controller, value) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`))
+            }
+            function fail(controller, detail) {
+              if (sawError) return
+              sawError = true
+              upstreamError = { message: String(detail?.message || detail?.hint || "WPS Lingxi upstream error"),
+                type: "upstream_error", code: detail?.code || "upstream_error" }
+              emit(controller, { error: upstreamError })
+            }
+            function dispatch(controller) {
+              const raw = dataLines.join("\n")
+              const name = eventName
+              eventName = ""; dataLines = []
+              if (sawError) return
+              let item
+              try { item = raw ? JSON.parse(raw) : null } catch {
+                fail(controller, { message: "Malformed upstream SSE data", code: "invalid_sse" }); return
+              }
+              if (name === "error") { fail(controller, item?.error || item); return }
+              if (!item) return
+              if (item.type === "error") { fail(controller, item.error || item.data || item); return }
+              if (ended) return
+              let delta
+              if (item.type === "reasoning" || item.type === "text") {
+                const value = typeof item.data === "object" ? item.data?.text || "" : String(item.data ?? "")
+                delta = item.type === "text" ? { content: value } : { reasoning_content: value }
+              } else if (item.type === "end" || item.type === "text_end") {
+                ended = true; delta = {}
+              } else return
+              emit(controller, { id: completionId, object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000), model: requestedModel,
+                choices: [{ delta, index: 0, finish_reason: ended ? "stop" : null }] })
+            }
+            function parse(text, controller, final = false) {
+              lineBuffer += text
+              // CRLF, LF and CR are all legal SSE line endings.
+              while (true) {
+                const match = /[\r\n]/.exec(lineBuffer)
+                if (!match || (!final && match[0] === "\r" && match.index === lineBuffer.length - 1)) break
+                const line = lineBuffer.slice(0, match.index)
+                const width = lineBuffer.slice(match.index, match.index + 2) === "\r\n" ? 2 : 1
+                lineBuffer = lineBuffer.slice(match.index + width)
+                if (!line) dispatch(controller)
+                else if (line.startsWith("event:")) eventName = line.slice(6).trim()
+                else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""))
+              }
+              if (final) {
+                if (lineBuffer.startsWith("data:")) dataLines.push(lineBuffer.slice(5).replace(/^ /, ""))
+                else if (lineBuffer.startsWith("event:")) eventName = lineBuffer.slice(6).trim()
+                if (eventName || dataLines.length) dispatch(controller)
+              }
+            }
             const streamTransform = new TransformStream({
-              transform(chunk, controller) {
-                lineBuffer += new TextDecoder().decode(chunk)
-                const lines = lineBuffer.split("\n")
-                lineBuffer = lines.pop() || ""
-
-                for (const line of lines) {
-                  if (line.startsWith("data:")) {
-                    const raw = line.slice(5).trim()
-                    if (!raw) continue
-                    try {
-                      const item = JSON.parse(raw)
-                      // 深度思考推理流 (Reasoning / Thinking)
-                      if (item.type === "reasoning" && item.data) {
-                        const reasoningText = typeof item.data === "object" ? item.data.text || "" : String(item.data)
-                        const sseEvent = {
-                          id: `chatcmpl-${Date.now()}`,
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: requestedModel,
-                          choices: [
-                            {
-                              delta: { reasoning_content: reasoningText },
-                              index: 0,
-                              finish_reason: null,
-                            },
-                          ],
-                        }
-                        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(sseEvent)}\n\n`))
-                      }
-                      // 正文内容增量 (Text content)
-                      else if (item.type === "text" && item.data) {
-                        const contentText = typeof item.data === "object" ? item.data.text || "" : String(item.data)
-                        const sseEvent = {
-                          id: `chatcmpl-${Date.now()}`,
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: requestedModel,
-                          choices: [
-                            {
-                              delta: { content: contentText },
-                              index: 0,
-                              finish_reason: null,
-                            },
-                          ],
-                        }
-                        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(sseEvent)}\n\n`))
-                      }
-                      // 结束标记
-                      else if (item.type === "text_end" || item.type === "end") {
-                        const sseEvent = {
-                          id: `chatcmpl-${Date.now()}`,
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: requestedModel,
-                          choices: [{ delta: {}, index: 0, finish_reason: "stop" }],
-                        }
-                        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(sseEvent)}\n\n`))
-                      }
-                    } catch {}
-                  }
-                }
-              },
+              transform(chunk, controller) { parse(decoder.decode(chunk, { stream: true }), controller) },
               flush(controller) {
-                controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
+                parse(decoder.decode(), controller, true)
+                if (!ended && !sawError) fail(controller, upstreamError)
+                if (!sawError) controller.enqueue(encoder.encode("data: [DONE]\n\n"))
               },
             })
 
@@ -505,6 +561,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             if (!stream) {
               const reader = upstreamRes.body.pipeThrough(streamTransform).getReader()
               let fullContent = ""
+              try {
               while (true) {
                 const { done, value } = await reader.read()
                 if (done) break
@@ -518,7 +575,14 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                   }
                 }
               }
+              } catch (error) {
+                signal?.throwIfAborted()
+                return errorResponse("WPS Lingxi upstream stream interrupted", 502, "incomplete_stream")
+              } finally {
+                reader.releaseLock()
+              }
 
+              if (sawError) return errorResponse(upstreamError.message, 502, upstreamError.code)
               const openAiResponse = {
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion",
