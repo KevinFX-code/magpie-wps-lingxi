@@ -11,5 +11,5 @@ jobs:
         with:
           node-version: '22'
       - run: node --check index.mjs
-      - run: node --test review.test.mjs
+      - run: node --test agent.test.mjs review.test.mjs
 
