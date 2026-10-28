@@ -715,5 +715,3 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
 }
 
 export default WPSLingxiAuthPlugin
-
-
