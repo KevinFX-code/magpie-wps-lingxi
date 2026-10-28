@@ -28,7 +28,7 @@
 - ⚡ **OpenAI 兼容 SSE 反代 (`auth.loader`)**  
   将通用的 `/v1/chat/completions` 请求转接至金山灵犀官方后端，自动维护会话会话生命周期，支持正文流式打字机与深度思考（`reasoning_content`）流式回传。
 - 🔑 **开箱即用鉴权 (`auth.methods`)**  
-  支持 Magpie 客户端内弹窗直接粘贴 `wps_sid`，亦支持自动拉起浏览器进行网页引导授权。
+  支持粘贴 `wps_sid` 或整段 Cookie；装了 Chrome / Edge 时可自动打开浏览器登录并抓取 Cookie（Safari 的自动化窗口不能手动输入，不支持自动登录）。
 
 ---
 
@@ -81,13 +81,18 @@ npm install "/path/to/magpie-wps-lingxi"
 ## 🚀 登录与使用指引
 
 ### 1. 登录授权
+
 安装后在终端运行：
 ```bash
 magpie plugin login wps-lingxi
 ```
-或直接在 **Magpie 桌面客户端** 的 Provider 管理面板中找到 **WPS 灵犀** 点击 **Login**：
-1. **直接粘贴**：打开 [lingxi.kdocs.cn](https://lingxi.kdocs.cn/)，按 `F12` -> 【Application/应用】->【Cookies】，复制 `wps_sid` 的值粘贴提交；
-2. **网页授权**：点击后将自动弹出本地向导页面，按提示粘贴确认即可完成绑定。
+或直接在 **Magpie 桌面客户端** 的 Provider 管理面板中找到 **WPS 灵犀** 点击 **Login**，有两种方式：
+
+1. **浏览器登录（推荐，自动抓 Cookie）**：插件会打开一个独立的浏览器窗口，你在里面正常登录 WPS；登录完成后 `wps_sid` 会自动读取并保存，**不需要复制任何东西**。
+   - macOS 上用 Chrome / Edge / Chromium / Brave（CDP 读 Cookie）。
+   - Safari 的自动化窗口在会话期间会锁住键盘，没法手动登录，而且它用临时配置读不到 Safari 现有的登录态 —— 所以 Safari 不支持自动登录；请装 Chrome/Edge，或用手动粘贴。
+   - 没有 Chromium 系浏览器时，页面会提示原因，并保留下面的手动粘贴方式。
+2. **手动粘贴（兜底）**：打开 [lingxi.wps.cn](https://lingxi.wps.cn/) 登录，按 `F12` → 【Application / 应用】→【Cookies】，复制 `wps_sid` 的值，或者直接粘整段 Cookie —— 插件只取其中的 `wps_sid`。
 
 ### 2. 查看配额与签到
 - 查看当前可用智点余额：
@@ -128,6 +133,18 @@ magpie plugin login wps-lingxi
 | `wps-lingxi/auto` | 自动智能调度模式 | 1M (1,048,576) | 1.0x | ✅ 支持 |
 
 ---
+
+## 🔌 两条对话平面（2026-10-28）
+
+| 平面 | 端点 | 能力 | 什么时候用 |
+|---|---|---|---|
+| 老会话平面 | `/api/aigc/v3/assistant/sessions/{id}/completions` | 只有一段 `user_input.text`，**没有 tools 槽位** | 纯文本补全 |
+| agent-runtime 直连 | `/api/public/v1/agent-runtime/chat/completions` | OpenAI 形状，`tools` / `tool_calls` **真可用**，`stream:false` 也通 | 带工具的 agent 客户端 |
+
+- 默认 `auto`：请求里带 `tools` 就走 agent-runtime，否则走老平面；`legacy` 平面收到 tools 会明确报错，不会静默丢弃。
+- agent-runtime 三步链：建 cowork session → 建 credits run → 调 chat/completions（头带 `x-cc-session-id` / `x-cc-run-id`）。run 按「账号 × 模型」缓存 1 小时；上游报 `SQLNoRows` / 会话不存在时自动重建一次。计费按 run，一个 run 内多次调用只扣一次智点。
+- 强制某一平面：`magpie plugin options @kevinfx/magpie-wps-lingxi '{"plane":"agent"}'`（或 `"legacy"`）。
+- 登录只认 `wps_sid`：可粘贴裸值、`wps_sid=…` 或整段 Cookie（自动取出 `wps_sid`，其余键丢弃）；账号按 sid 的 hash 区分，界面只显示尾号 4 位。上游 401 会把账号标成需重新登录。
 
 ## 🛠 独立测试
 
