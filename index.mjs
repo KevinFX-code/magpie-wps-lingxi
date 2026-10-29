@@ -31,6 +31,14 @@ const DEFAULT_MODELS = [
   { id: "plan_max", name: "Max 模式 (复杂任务)", context: 1048576, multiplier: "1.0x", reasoning: true },
 ]
 
+// variantsOf is a model's variants as OpenCode and magpie read them: an object
+// with one key per level, not an array. magpie's plugin host takes
+// Object.keys(variants), and an array's keys are its indexes — which is how
+// ["low","high","max"] came to be read as the levels "0", "1", "2".
+function variantsOf(reasoning) {
+  return reasoning ? { low: {}, high: {}, max: {} } : {}
+}
+
 function configModels() {
   return Object.fromEntries(
     DEFAULT_MODELS.map((m) => [
@@ -39,7 +47,7 @@ function configModels() {
         name: `${m.name} (${m.multiplier})`,
         limit: { context: m.context, output: 65536 },
         tool_call: true,
-        ...(m.reasoning ? { reasoning: true, variants: ["low", "high", "max"] } : {}),
+        ...(m.reasoning ? { reasoning: true, variants: variantsOf(true) } : {}),
       },
     ])
   )
@@ -68,7 +76,7 @@ function modelOf(provider, m) {
       interleaved: false,
     },
     release_date: "",
-    variants: isReasoning ? ["low", "high", "max"] : [],
+    variants: variantsOf(isReasoning),
   }
 }
 
@@ -154,7 +162,23 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
       p.name ??= "WPS 灵犀"
       p.npm ??= NPM
       p.api ??= `${LINGXI_BASE}/api`
-      p.models = { ...configModels(), ...(p.models ?? {}) }
+      // the variants are this plugin's own, not those a host stored from an
+      // earlier release (an array, whose keys it read as "0", "1", "2"); a
+      // model this plugin doesn't define is left without them, which a host
+      // reads as one that thinks with no levels to pick, not as one that has
+      // none. The default row stays under a stored one, so a stored row that
+      // says less keeps what it doesn't say.
+      const defaults = configModels()
+      const stored = p.models ?? {}
+      p.models = Object.fromEntries(
+        Object.keys({ ...defaults, ...stored }).map((id) => {
+          const base = defaults[id] ?? {}
+          const m = { ...base, ...(stored[id] ?? {}) }
+          if (base.variants) m.variants = base.variants
+          else delete m.variants
+          return [id, m]
+        })
+      )
     },
 
     provider: {
