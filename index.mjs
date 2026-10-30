@@ -240,6 +240,66 @@ function warnOnce(message) {
   console.warn(`[magpie-wps-lingxi] ${message}`)
 }
 
+// ── 单次请求的提示词预算 ────────────────────────────────────────────────
+// 上游对单次请求有硬性 token 上限。越线时网页通路返回
+//   event:error  {"result":"PromptTokenExceedLimit","msg":"场景token超过限制"}
+// 原生通路返回 400 {"code":"AIError","message":"AI服务异常"}。
+// 压平后的历史只增不减，一旦越线，之后每一轮都会失败，整个会话就废了
+// （实测：原生 800KB≈139K token 正常，603KB 的混合内容直接 400）。
+// 所以这里在客户端设预算，超了从最老的历史开始丢。
+const MAX_PROMPT_KB = Math.max(32, Number(process.env.MAGPIE_LINGXI_MAX_PROMPT_KB || 320))
+const MAX_PROMPT_BYTES = MAX_PROMPT_KB * 1024
+
+function byteLength(text) {
+  const s = typeof text === "string" ? text : String(text ?? "")
+  if (typeof Buffer !== "undefined") return Buffer.byteLength(s, "utf8")
+  return new TextEncoder().encode(s).length
+}
+
+// 单条历史消息的上限。实测一次 533KB 的粘贴就足以让「整条整条丢」的裁剪
+// 直接跳空：丢掉那一条等于把其余全部历史一起牺牲。所以先把过长的那条
+// 掐头去尾留中段标记，再去按预算丢整条。
+const MAX_HISTORY_LINE_KB = Math.max(4, Number(process.env.MAGPIE_LINGXI_MAX_HISTORY_LINE_KB || 32))
+const MAX_HISTORY_LINE_BYTES = MAX_HISTORY_LINE_KB * 1024
+
+function headBytes(text, maxBytes) {
+  if (typeof Buffer === "undefined") return text.slice(0, maxBytes)
+  const buf = Buffer.from(text, "utf8")
+  if (buf.length <= maxBytes) return text
+  let end = maxBytes
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1
+  return buf.subarray(0, end).toString("utf8")
+}
+
+function tailBytes(text, maxBytes) {
+  if (typeof Buffer === "undefined") return text.slice(-maxBytes)
+  const buf = Buffer.from(text, "utf8")
+  if (buf.length <= maxBytes) return text
+  let start = buf.length - maxBytes
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start += 1
+  return buf.subarray(start).toString("utf8")
+}
+
+function elideLongLine(line) {
+  const size = byteLength(line)
+  if (size <= MAX_HISTORY_LINE_BYTES) return line
+  const headBudget = Math.floor(MAX_HISTORY_LINE_BYTES * 0.6)
+  const tailBudget = MAX_HISTORY_LINE_BYTES - headBudget
+  return `${headBytes(line, headBudget)}\n…[本条历史过长已截断：原 ${(size / 1024).toFixed(0)}KB]…\n${tailBytes(line, tailBudget)}`
+}
+
+// 这些错误重试没有意义，Magpie 默认会重试 7 次（每次白等 7 秒再报 502）
+const NON_RETRYABLE_CODES = new Set([
+  "PromptTokenExceedLimit",
+  "prompt_token_exceed_limit",
+  "ContentFilter",
+  "invalid_reasoning_effort",
+])
+
+function statusForCode(code, fallback = 502) {
+  return NON_RETRYABLE_CODES.has(String(code ?? "")) ? 400 : fallback
+}
+
 /**
  * 被原生计费接口拒绝过的 key。cowork 目录里列了 6 个模型，但实测只有
  * deepseek-v4-* / kimi-k2.6 能领到 run_id；GLM-5.1、GLM-5-Turbo、plan_*
@@ -385,10 +445,43 @@ function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } })
 }
 
+/**
+ * 原生通路同样要控预算：实测 603KB 的 messages 会被上游直接 400 AIError。
+ * 从最老的消息开始丢，但永远保留最后一条（当前请求）。
+ */
+function fitNativePayload(payload) {
+  const sizeOf = (m) => byteLength(m.content) + (Array.isArray(m.tool_calls) ? byteLength(JSON.stringify(m.tool_calls)) : 0)
+  let total = byteLength(payload.context || "")
+  if (Array.isArray(payload.tools)) total += byteLength(JSON.stringify(payload.tools))
+  const sizes = payload.messages.map(sizeOf)
+  total += sizes.reduce((a, b) => a + b, 0)
+  if (total <= MAX_PROMPT_BYTES) return { dropped: 0, overflow: false }
+
+  let start = 0
+  while (total > MAX_PROMPT_BYTES && payload.messages.length - start > 1) {
+    total -= sizes[start]
+    start += 1
+  }
+  payload.messages = payload.messages.slice(start)
+  return { dropped: start, overflow: total > MAX_PROMPT_BYTES }
+}
+
 // 原生通路：① credits/runs 领 run_id → ② agent-runtime/chat/completions → ③ 转成 OpenAI 形状
 async function nativeCompletion({ body, cookie, signal, modelKey }) {
   const stream = body.stream !== false
   const payload = nativePayload(body, modelKey)
+  const fit = fitNativePayload(payload)
+  if (fit.overflow) {
+    return jsonResponse({
+      error: {
+        message: `本轮请求本身超过上游长度上限（预算 ${MAX_PROMPT_KB}KB）：SYSTEM/工具清单/当前消息太大。` +
+          `可调大 MAGPIE_LINGXI_MAX_PROMPT_KB。`,
+        type: "upstream_error",
+        code: "prompt_token_exceed_limit",
+      },
+    }, 400)
+  }
+  if (fit.dropped > 0) warnOnce(`原生通路历史超出 ${MAX_PROMPT_KB}KB 预算，已丢弃更早的消息`)
   // 每请求一个独立 session：实测同 session 并发 8 路也正常（无互斥、无串扰），
   // 独立 session 只是为了不依赖任何服务端会话状态，代价为零。
   const sessionId = String(Date.now()) + String(Math.floor(Math.random() * 100)).padStart(2, "0")
@@ -997,19 +1090,64 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               request = "（请继续。）"
             }
 
+            // 从最老的一端整条整条地丢，保留一段「最新的连续历史」。
+            // 不能挑着丢：assistant 的 tool_calls 和紧跟其后的 tool 结果必须成对，
+            // 中间挖洞会让上游直接拒绝。过长的那一条先掐头去尾，避免「丢一条等于丢全部」。
             const history = []
+            let elided = 0
             for (const m of historyMessages) {
               const role = m?.role
               if (role === "system" || role === "developer") continue
               const line = renderMessage(m)
-              if (line) history.push(line)
+              if (!line) continue
+              if (byteLength(line) > MAX_HISTORY_LINE_BYTES) {
+                elided += 1
+                history.push(elideLongLine(line))
+              } else {
+                history.push(line)
+              }
             }
 
+            const systemSection = systemTexts.length ? `SYSTEM:\n${systemTexts.join("\n\n")}` : ""
+            const toolsSection = tools.length ? `TOOLS:\n${toolProtocolPrompt(tools)}` : ""
+            const requestSection = `User: ${request}`
+
+            // 先算「不可省略」的部分：SYSTEM + TOOLS + 本次请求。
+            const fixedBytes = byteLength([systemSection, toolsSection, requestSection].filter(Boolean).join("\n\n"))
+            if (fixedBytes > MAX_PROMPT_BYTES) {
+              return errorResponse(
+                `本轮请求本身就超过上游长度上限（${(fixedBytes / 1024).toFixed(0)}KB > ${MAX_PROMPT_KB}KB）：` +
+                `SYSTEM/工具清单/当前消息太大。可调大 MAGPIE_LINGXI_MAX_PROMPT_KB，或换用原生通路的模型。`,
+                400,
+                "prompt_token_exceed_limit",
+              )
+            }
+
+            // 从最老的一端整条整条地丢，保留一段「最新的连续历史」。
+            // 不能挑着丢：assistant 的 tool_calls 和紧跟其后的 tool 结果必须成对，
+            // 中间挖洞会让上游直接拒绝。
+            const renderedHistory = history.join("\n\n")
+            let totalBytes = fixedBytes + (history.length ? byteLength(renderedHistory) + 2 : 0)
+            let start = 0
+            while (totalBytes > MAX_PROMPT_BYTES && start < history.length) {
+              totalBytes -= byteLength(history[start]) + 2
+              start += 1
+            }
+            const keptHistory = history.slice(start)
+            const dropped = start
+
             const sections = []
-            if (systemTexts.length) sections.push(`SYSTEM:\n${systemTexts.join("\n\n")}`)
-            if (tools.length) sections.push(`TOOLS:\n${toolProtocolPrompt(tools)}`)
-            if (history.length) sections.push(history.join("\n\n"))
-            sections.push(`User: ${request}`)
+            if (systemSection) sections.push(systemSection)
+            if (toolsSection) sections.push(toolsSection)
+            if (dropped > 0 || elided > 0) {
+              const notes = []
+              if (dropped > 0) notes.push(`更早的 ${dropped} 条消息被省略`)
+              if (elided > 0) notes.push(`${elided} 条过长消息被截断`)
+              sections.push(`[历史已压缩：${notes.join("，")}（上游单次请求长度上限 ${MAX_PROMPT_KB}KB）]`)
+              warnOnce(`网页通路历史超出 ${MAX_PROMPT_KB}KB 预算，已压缩历史（省略 ${dropped} 条 / 截断 ${elided} 条）`)
+            }
+            if (keptHistory.length) sections.push(keptHistory.join("\n\n"))
+            sections.push(requestSection)
             const question = sections.join("\n\n")
 
             // Normalize named client variants to the upstream 0/1/2 protocol.
@@ -1158,8 +1296,13 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             function fail(controller, detail) {
               if (sawError) return
               sawError = true
-              upstreamError = { message: String(detail?.message || detail?.hint || "WPS Lingxi upstream error"),
-                type: "upstream_error", code: detail?.code || "upstream_error" }
+              // 灵犀的错误帧用的是 { result, msg }，不是 { code, message }：
+              //   event:error  data:{"result":"PromptTokenExceedLimit","msg":"场景token超过限制"}
+              // 之前只读 message/hint，整条信息被吞成一句 "WPS Lingxi upstream error"，
+              // 客户端只能看到 502 并反复重试，完全查不出原因。
+              const code = detail?.code || detail?.result || "upstream_error"
+              const message = detail?.message || detail?.msg || detail?.hint || detail?.result || "WPS Lingxi upstream error"
+              upstreamError = { message: String(message), type: "upstream_error", code: String(code) }
               emit(controller, { error: upstreamError })
             }
             function dispatch(controller) {
@@ -1250,7 +1393,8 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 reader.releaseLock()
               }
 
-              if (sawError) return errorResponse(upstreamError.message, 502, upstreamError.code)
+              // 提示词超限这类错误重试没有意义，回 400 让上层别白跑 7 次
+              if (sawError) return errorResponse(upstreamError.message, statusForCode(upstreamError.code), upstreamError.code)
               const hasToolCalls = toolCalls.length > 0
               const openAiResponse = {
                 id: `chatcmpl-${Date.now()}`,
