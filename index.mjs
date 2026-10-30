@@ -25,7 +25,12 @@ const TOOL_BRIDGE_ENABLED = process.env.MAGPIE_LINGXI_TOOL_BRIDGE !== "0"
 function contentToText(content) {
   if (typeof content === "string") return content
   if (Array.isArray(content)) {
-    return content.map((part) => (typeof part === "string" ? part : (part?.text ?? ""))).join("")
+    return content.map((part) => {
+      if (typeof part === "string") return part
+      // 上游 completions 只收文本，图片不能静默丢掉，至少留一个可解释的占位
+      if (part?.type === "image" || part?.type === "image_url" || part?.type === "input_image") return "[image]"
+      return part?.text ?? ""
+    }).join("")
   }
   if (content == null) return ""
   return JSON.stringify(content)
@@ -536,7 +541,9 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             const tools = TOOL_BRIDGE_ENABLED ? normalizeTools(body.tools) : []
             const toolNames = new Set(tools.map((t) => t.name))
 
-            // 历史消息（含工具调用与工具结果）压平成上游唯一接受的 question 文本
+            // 上游只接受一个 question 文本，结构化对话必须压平；但压平不等于抹平：
+            // system 单独成段放最前、工具清单独立成段、历史与当前请求分开，
+            // 模型才不会把系统指令当成“引用的历史文本”，也不会把工具表当成闲聊内容。
             function renderMessage(m) {
               const text = contentToText(m?.content)
               if (m?.role === "assistant") {
@@ -544,35 +551,50 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 return body ? `Assistant: ${body}` : ""
               }
               if (m?.role === "tool" || m?.role === "function") {
-                return `Tool result (${m?.name || m?.tool_call_id || "tool"}): ${text}`
+                return `Tool (${m?.name || m?.tool_call_id || "tool"}): ${text}`
               }
-              if (m?.role === "system" || m?.role === "developer") return `[System: ${text}]`
               return `User: ${text}`
             }
 
-            let question = ""
-            if (messages.length === 1) {
-              question = contentToText(messages[0]?.content)
-            } else if (messages.length > 1) {
-              const lastUser = [...messages].reverse().find((m) => m.role === "user")
-              const currentQ = contentToText(lastUser?.content)
-              const history = []
-              for (const m of messages) {
-                if (m === lastUser) break
-                const line = renderMessage(m)
-                if (line) history.push(line)
-              }
-              question = history.length ? `${history.join("\n\n")}\n\nUser: ${currentQ}` : currentQ
+            // 同一段 system 在多轮里会重复下发，去重后只保留一份
+            const systemTexts = []
+            for (const m of messages) {
+              if (m?.role !== "system" && m?.role !== "developer") continue
+              const text = contentToText(m.content).trim()
+              if (text && !systemTexts.includes(text)) systemTexts.push(text)
             }
 
-            if (!question) {
-              question = "你好"
+            // 最后一条是用户消息 → 它才是本次请求；否则（工具结果回灌等）整段按时间顺序保留，
+            // 补一句“继续”，避免把 assistant/tool 消息排到请求前面去。
+            const trailing = messages.length ? messages[messages.length - 1] : null
+            const endsWithUser = trailing?.role === "user"
+            let request
+            let historyMessages = messages
+            if (endsWithUser) {
+              request = contentToText(trailing.content)
+              historyMessages = messages.slice(0, -1)
+            } else if (!messages.length) {
+              request = "你好"
+            } else if (trailing?.role === "tool" || trailing?.role === "function") {
+              request = "（工具已返回结果，请据此继续，不要重复调用同一个工具。）"
+            } else {
+              request = "（请继续。）"
             }
 
-            // 上游没有 tools 参数，工具清单只能随提示词下发
-            if (tools.length) {
-              question = `${toolProtocolPrompt(tools)}\n\n${question}`
+            const history = []
+            for (const m of historyMessages) {
+              const role = m?.role
+              if (role === "system" || role === "developer") continue
+              const line = renderMessage(m)
+              if (line) history.push(line)
             }
+
+            const sections = []
+            if (systemTexts.length) sections.push(`SYSTEM:\n${systemTexts.join("\n\n")}`)
+            if (tools.length) sections.push(`TOOLS:\n${toolProtocolPrompt(tools)}`)
+            if (history.length) sections.push(history.join("\n\n"))
+            sections.push(`User: ${request}`)
+            const question = sections.join("\n\n")
 
             // Normalize named client variants to the upstream 0/1/2 protocol.
             const effort = body.reasoning_effort ?? body.reasoningEffort ?? body.thinking_level

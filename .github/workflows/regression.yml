@@ -13,4 +13,5 @@ jobs:
       - run: node --check index.mjs
       - run: node --test review.test.mjs
       - run: node --test tools.test.mjs
+      - run: node --test prompt.test.mjs
 

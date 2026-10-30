@@ -152,9 +152,9 @@ test('native tool calls are bridged to OpenAI tool_calls', async (t) => {
           { role: 'user', content: 'now what' },
         ],
       })
-      assert.match(body.question, /\[System: be brief\]/)
+      assert.match(body.question, /SYSTEM:\nbe brief/)
       assert.match(body.question, /Assistant: <\|FunctionCallBegin\|>/)
-      assert.match(body.question, /Tool result \(write\): ok/)
+      assert.match(body.question, /Tool \(write\): ok/)
       assert.match(body.question, /User: now what$/)
     })
   } finally {
