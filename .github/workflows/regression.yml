@@ -15,4 +15,5 @@ jobs:
       - run: node --test tools.test.mjs
       - run: node --test prompt.test.mjs
       - run: node --test native.test.mjs
+      - run: node --test native-mode.test.mjs
 

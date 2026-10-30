@@ -23,18 +23,38 @@
   无缝接入 Magpie 全局定时签到任务池，每日自动调用金山官方任务中心领取每日智点奖励，记录连续签到天数并防漏签。
 - 📊 **智点额度监控 (`auth.usage`)**  
   对齐 Magpie Quota 规范，在桌面端配额面板中实时显示剩余可用「智点」总额与最近算力到期时间。
-- 🔄 **动态同步网页模型 (`provider.models`)**  
-  启动或登录后自动与 WPS 灵犀网页端 1:1 动态对齐最新模型列表（13+ 个主流模型），精准标注官方消耗倍率与 1M（1,048,576 tokens）超长上下文。
+- 🔄 **动态同步模型目录 (`provider.models`)**  
+  启动或登录后自动对齐灵犀最新模型：原生通路读 `cowork` 的模型目录（含 `plan_pro` / `plan_max` 模式），网页通路回落到灵犀网页模型表（13+ 个，带倍率与 1M 上下文）。
+- 🧬 **原生 Agent Runtime（0.2 新增，推荐）**  
+  走灵犀桌面客户端同款通路 `cowork.wps.cn/api/public/v1/agent-runtime/chat/completions`：**原生 `messages` / `tools` 进，原生 `tool_calls` / `reasoning_content` / `usage` 出**。不再压平提示词、不再从正文反解工具调用，工具循环与官方客户端一致，并带回真实 token 用量。每个请求先 `POST /api/public/v1/credits/runs` 领 `run_id` 再发起。
 - ⚡ **OpenAI 兼容 SSE 反代 (`auth.loader`)**  
-  将通用的 `/v1/chat/completions` 请求转接至金山灵犀官方后端，自动维护会话会话生命周期，支持正文流式打字机与深度思考（`reasoning_content`）流式回传。
-- 🧰 **工具调用桥接 (`tools` → `tool_calls`)**  
-  灵犀后端是聊天应用而非函数调用 API，模型会把调用写在正文里（`<|FunctionCallBegin|>[{"name":…,"parameters":…}]<|FunctionCallEnd|>`）。插件把请求里的 `tools` 压进提示词，再把这段信封流式翻译成标准 OpenAI `tool_calls`（含 `finish_reason: "tool_calls"`），工具循环因此可以正常跑通。设置 `MAGPIE_LINGXI_TOOL_BRIDGE=0` 可关闭。
+  将通用的 `/v1/chat/completions` 请求转接至金山灵犀官方后端，支持流式打字机、深度思考（`reasoning_content`）与 `[DONE]` 收尾。
+- 🧰 **网页通路兜底（legacy）**  
+  模型不在原生目录里时自动回落到 0.1.x 的网页聊天通路：`tools` 压进提示词，再把正文里的 `<|FunctionCallBegin|>[{"name":…,"parameters":…}]<|FunctionCallEnd|>` 流式翻译成标准 `tool_calls`（含 `finish_reason: "tool_calls"`）。设置 `MAGPIE_LINGXI_TOOL_BRIDGE=0` 可关闭桥接。
 - 🧭 **结构化提示词 (`SYSTEM` / `TOOLS` / 历史 / `User`)**  
-  上游只收一个 `question` 字符串，插件按 `SYSTEM → TOOLS → 历史 → User` 分段压平：system 提到最前并去重、工具清单独立成段、历史严格按时间顺序（工具结果回灌时自动补“继续”），避免系统指令被当成“引用的历史文本”。
+  网页通路只收一个 `question` 字符串，插件按 `SYSTEM → TOOLS → 历史 → User` 分段压平：system 提到最前并去重、工具清单独立成段、历史严格按时间顺序（工具结果回灌时自动补“继续”），避免系统指令被当成“引用的历史文本”。
 - 🧬 **对齐网页端原生调用 (`expect_model` / `thinking` / `with_mcp`)**  
-  请求体按灵犀网页端的真实字段构造：`question`、`expect_model`、`thinking`（`auto`/`disabled`，由 `reasoning_effort` 推导）、`with_mcp`、`with_expert`、`user_input`，并沿用 `X-Cc-Version` / `X-Client-Type` / `X-Cc-Entrance` 头。`MAGPIE_LINGXI_THINKING=auto|disabled` 可强制思考档位，`MAGPIE_LINGXI_WITH_MCP=1` 可打开服务端 MCP 工具。
+  网页通路的请求体按真实字段构造：`question`、`expect_model`、`thinking`（`auto`/`disabled`，由 `reasoning_effort` 推导）、`with_mcp`、`with_expert`、`user_input`，并沿用 `X-Cc-Version` / `X-Client-Type` / `X-Cc-Entrance` 头。`MAGPIE_LINGXI_THINKING=auto|disabled` 可强制思考档位，`MAGPIE_LINGXI_WITH_MCP=1` 可打开服务端 MCP 工具。
 - 🔑 **开箱即用鉴权 (`auth.methods`)**  
   支持 Magpie 客户端内弹窗直接粘贴 `wps_sid`，亦支持自动拉起浏览器进行网页引导授权。
+
+---
+
+## 🧭 两条通路与模式开关
+
+| 通路 | 端点 | 输入 | 输出 |
+|---|---|---|---|
+| **native**（默认） | `cowork.wps.cn/…/agent-runtime/chat/completions` | 原生 `messages` + `tools` | 原生 `tool_calls` / `reasoning_content` / `usage` |
+| **legacy**（兜底） | `lingxi.kdocs.cn/…/assistant/sessions/{id}/completions` | 单个 `question` 文本 | 文本信封 → 插件反解 `tool_calls` |
+
+模式由 `MAGPIE_LINGXI_MODE` 控制：
+
+- `auto`（默认）：模型在原生目录里走 native，否则走 legacy
+- `native`：强制 native（模型名必须是 `cowork` 目录里的 key）
+- `legacy`：强制旧网页通路（0.1.x 行为）
+
+> 原生通路是客户端私有网关，非公开接口；若上游调整字段，插件会明确返回错误而不是静默降级。
+
 
 ---
 

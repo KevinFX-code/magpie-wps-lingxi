@@ -216,6 +216,275 @@ const DEFAULT_MODELS = [
   { id: "plan_max", name: "Max 模式 (复杂任务)", context: 1048576, multiplier: "1.0x", reasoning: true },
 ]
 
+// ── 原生 Agent Runtime（灵犀桌面端同款通路）────────────────────────────────
+// 网页聊天接口只收一个 question 字符串；桌面客户端用的是 cowork 的 Agent Runtime：
+// 收原生 messages / tools，吐原生 tool_calls / reasoning_content / usage。
+// 这里按「原生优先、网页兜底」路由：模型在原生目录里就走原生，否则回落到 0.1.x 的网页通路。
+const NATIVE_BASE = "https://cowork.wps.cn"
+const NATIVE_MODE = (process.env.MAGPIE_LINGXI_MODE || "auto").toLowerCase() // auto | native | legacy
+
+/** 原生模型目录：key -> { key, name, desc }；由 provider.models() 填充 */
+const nativeCatalog = new Map()
+
+function nativeHeaders(cookie, extra = {}) {
+  return {
+    Cookie: cookie,
+    "Content-Type": "application/json",
+    "X-Client-Type": "wps_separate",
+    "X-Cc-Agent-Type": "lingxi_claw",
+    ...extra,
+  }
+}
+
+async function fetchNativeCatalog(cookie, signal) {
+  const res = await fetch(`${NATIVE_BASE}/api/aioffice/v1/sessions/plans`, {
+    headers: { Cookie: cookie, "X-Client-Type": "wps_separate" },
+    signal,
+  })
+  if (!res.ok) throw new Error(`native catalog: HTTP ${res.status}`)
+  const json = await res.json()
+  const data = json?.data || {}
+  const list = []
+  for (const m of data.models || []) {
+    if (m?.key) list.push({ key: m.key, name: m.name || m.key, desc: m.desc || "" })
+  }
+  for (const p of data.plans || []) {
+    if (p?.key) list.push({ key: p.key, name: p.name || p.key, desc: p.desc || "" })
+  }
+  if (!list.length) throw new Error("native catalog is empty")
+  nativeCatalog.clear()
+  for (const m of list) nativeCatalog.set(m.key, m)
+  return list
+}
+
+// 原生接口的推理档位是 low/high/max；网页通路是 0/1/2，两边都要认
+const NATIVE_EFFORT = { low: "low", high: "high", max: "max", "0": "low", "1": "high", "2": "max" }
+
+function splitSystemMessages(messages) {
+  const system = []
+  const rest = []
+  for (const m of messages) {
+    const role = m?.role
+    if (role === "system" || role === "developer") {
+      const text = contentToText(m.content).trim()
+      if (text && !system.includes(text)) system.push(text)
+      continue
+    }
+    rest.push(m)
+  }
+  return { context: system.join("\n\n"), messages: rest }
+}
+
+function toNativeMessages(messages) {
+  const out = []
+  for (const m of messages) {
+    const role = m?.role
+    if (role === "assistant") {
+      const entry = { role: "assistant", content: contentToText(m.content) }
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length) entry.tool_calls = m.tool_calls
+      if (typeof m.reasoning_content === "string" && m.reasoning_content) entry.reasoning_content = m.reasoning_content
+      out.push(entry)
+    } else if (role === "tool" || role === "function") {
+      out.push({ role: "tool", tool_call_id: m.tool_call_id || m.id || "", content: contentToText(m.content) })
+    } else if (role === "user") {
+      out.push({ role: "user", content: contentToText(m.content) })
+    }
+  }
+  return out
+}
+
+function nativePayload(body, modelKey) {
+  const { context, messages } = splitSystemMessages(body.messages || [])
+  const args = {}
+  if (Number.isFinite(body.max_tokens)) args.max_tokens = body.max_tokens
+  if (Number.isFinite(body.temperature)) args.temperature = body.temperature
+  if (Number.isFinite(body.top_p)) args.top_p = body.top_p
+  if (Array.isArray(body.stop)) args.stop = body.stop
+
+  const payload = {
+    stream: body.stream !== false,
+    model: modelKey,
+    messages: toNativeMessages(messages),
+    base_llm_arguments: args,
+    sec_text: { from: "AI_WPS_SMARTASSISTANT", scene: "soul_claw" },
+  }
+  if (context) payload.context = context
+  if (Array.isArray(body.tools) && body.tools.length) payload.tools = body.tools
+  if (body.tool_choice) payload.tool_choice = body.tool_choice
+  const effort = NATIVE_EFFORT[String(body.reasoning_effort ?? body.reasoningEffort ?? "").toLowerCase()]
+  if (effort) payload.reasoning_effort = effort
+  return payload
+}
+
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } })
+}
+
+// 原生通路：① credits/runs 领 run_id → ② agent-runtime/chat/completions → ③ 转成 OpenAI 形状
+async function nativeCompletion({ body, cookie, signal, modelKey }) {
+  const stream = body.stream !== false
+  const payload = nativePayload(body, modelKey)
+  // 每请求一个独立 session，避免同会话并发被上游互斥
+  const sessionId = String(Date.now()) + String(Math.floor(Math.random() * 100)).padStart(2, "0")
+
+  let runRes
+  try {
+    runRes = await fetch(`${NATIVE_BASE}/api/public/v1/credits/runs`, {
+      method: "POST",
+      signal,
+      headers: nativeHeaders(cookie, { "X-Cc-Session-ID": sessionId }),
+      body: JSON.stringify({
+        client_type: "wps_separate",
+        client_request_id: String(Date.now()),
+        session_id: sessionId,
+        model_provider: "lingxi",
+        model_id: modelKey,
+      }),
+    })
+  } catch (error) {
+    signal?.throwIfAborted()
+    return jsonResponse({ error: { message: `WPS 灵犀计费 run 请求失败: ${error.message}`, type: "upstream_error" } }, 502)
+  }
+  if (!runRes.ok) {
+    const text = await runRes.text().catch(() => "")
+    return jsonResponse({
+      error: { message: `WPS 灵犀计费 run 被拒: HTTP ${runRes.status} ${text.slice(0, 200)}`, type: "upstream_error" },
+    }, runRes.status)
+  }
+  const runJson = await runRes.json().catch(() => ({}))
+  const runId = runJson?.data?.run_id
+  if (!runId) {
+    return jsonResponse({ error: { message: "WPS 灵犀未返回 run_id", type: "upstream_error" } }, 502)
+  }
+
+  let chatRes
+  try {
+    chatRes = await fetch(`${NATIVE_BASE}/api/public/v1/agent-runtime/chat/completions`, {
+      method: "POST",
+      signal,
+      headers: nativeHeaders(cookie, {
+        Accept: "text/event-stream",
+        "X-Cc-Session-ID": sessionId,
+        "X-Cc-Run-ID": String(runId),
+        "AI-Gateway-Product-Name": "wps-public-pc",
+        "AI-Gateway-Intention-Code": "wps_public_home_agentconversation",
+        "X-Client-Lang": "zh-CN",
+        "X-Request-Id": cryptoRandomId(),
+      }),
+      body: JSON.stringify(payload),
+    })
+  } catch (error) {
+    signal?.throwIfAborted()
+    return jsonResponse({ error: { message: `WPS 灵犀原生接口不可达: ${error.message}`, type: "upstream_error" } }, 502)
+  }
+  if (!chatRes.ok) {
+    const text = await chatRes.text().catch(() => "")
+    return jsonResponse({
+      error: { message: `WPS 灵犀原生接口异常: HTTP ${chatRes.status} ${text.slice(0, 200)}`, type: "upstream_error" },
+    }, chatRes.status)
+  }
+
+  if (!stream) {
+    const json = await chatRes.json().catch(() => null)
+    const choice = json?.choices?.[0] || {}
+    const message = { role: "assistant", content: choice.text || null }
+    if (choice.reasoning_content) message.reasoning_content = choice.reasoning_content
+    if (Array.isArray(choice.tool_calls) && choice.tool_calls.length) message.tool_calls = choice.tool_calls
+    return jsonResponse({
+      id: `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: modelKey,
+      choices: [{ index: 0, message, finish_reason: choice.finish_reason || "stop" }],
+      ...(json?.usage ? { usage: normalizeUsage(json.usage) } : {}),
+    })
+  }
+
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder()
+  const completionId = `chatcmpl-${Date.now()}`
+  let buffer = ""
+  let done = false
+
+  const emit = (controller, delta, finishReason = null, usage) => {
+    const value = {
+      id: completionId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: modelKey,
+      choices: [{ delta, index: 0, finish_reason: finishReason }],
+    }
+    if (usage) value.usage = usage
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`))
+  }
+
+  const handle = (controller, line) => {
+    if (!line.startsWith("data:")) return
+    const raw = line.slice(5).trim()
+    if (!raw || raw === "[DONE]") return
+    let item
+    try { item = JSON.parse(raw) } catch { return }
+    if (item.code && item.code !== "Success") {
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: item.message || item.code, type: "upstream_error", code: item.code } })}\n\n`))
+      done = true
+      return
+    }
+    const choice = item.choices?.[0] || {}
+    if (choice.reasoning_content) emit(controller, { reasoning_content: choice.reasoning_content })
+    if (choice.text) emit(controller, { content: choice.text })
+    if (Array.isArray(choice.tool_calls) && choice.tool_calls.length) {
+      emit(controller, { tool_calls: choice.tool_calls })
+    }
+    if (choice.finish_reason) {
+      done = true
+      emit(controller, {}, choice.finish_reason, item.usage ? normalizeUsage(item.usage) : undefined)
+    }
+  }
+
+  const transform = new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true })
+      let index
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, index).replace(/\r$/, "")
+        buffer = buffer.slice(index + 1)
+        if (line.trim()) handle(controller, line)
+      }
+    },
+    flush(controller) {
+      const tail = (buffer + decoder.decode()).trim()
+      if (tail) handle(controller, tail)
+      if (!done) emit(controller, {}, "stop")
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+    },
+  })
+
+  return new Response(chatRes.body.pipeThrough(transform), {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  })
+}
+
+function normalizeUsage(usage) {
+  return {
+    prompt_tokens: Number(usage.prompt_tokens || 0),
+    completion_tokens: Number(usage.completion_tokens || 0),
+    total_tokens: Number(usage.total_tokens || 0),
+    ...(usage.cached_tokens ? { prompt_tokens_details: { cached_tokens: Number(usage.cached_tokens) } } : {}),
+  }
+}
+
+function cryptoRandomId() {
+  try {
+    return globalThis.crypto.randomUUID()
+  } catch {
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }
+}
+
 function configModels() {
   return Object.fromEntries(
     DEFAULT_MODELS.map((m) => [
@@ -344,9 +613,22 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
 
     provider: {
       id: PROVIDER,
-      // 登录后动态同步官方最新模型列表
+      // 原生通路用 cowork 的模型目录（key/name/desc），网页通路用灵犀网页的模型表
       async models(provider, { auth } = {}) {
         const cookie = resolveCookie(auth)
+        if (cookie && NATIVE_MODE !== "legacy") {
+          try {
+            const list = await fetchNativeCatalog(cookie)
+            return Object.fromEntries(list.map((m) => [m.key, modelOf(provider, {
+              id: m.key,
+              name: m.name,
+              context: 1048576,
+              reasoning: true,
+            })]))
+          } catch {
+            // 原生目录不可用 → 回落到网页模型表，loader 也会走网页通路
+          }
+        }
         if (cookie) {
           const live = await fetchLiveModels(cookie)
           if (live.length) {
@@ -547,6 +829,20 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
 
             if (!requestedModel || requestedModel === "default") {
               requestedModel = "deepseek-v4.1-flash"
+            }
+
+            // 原生通路优先：模型在 cowork 目录里就走 Agent Runtime（原生 messages/tools），
+            // 否则回落到下面 0.1.x 的网页聊天通路。目录由 provider.models() 预热。
+            if (NATIVE_MODE !== "legacy" && cookie) {
+              const isNative = nativeCatalog.has(requestedModel) || NATIVE_MODE === "native"
+              if (isNative) {
+                try {
+                  return await nativeCompletion({ body, cookie, signal, modelKey: requestedModel })
+                } catch (error) {
+                  signal?.throwIfAborted()
+                  return errorResponse(`WPS 灵犀原生接口异常: ${error.message}`)
+                }
+              }
             }
 
             const tools = TOOL_BRIDGE_ENABLED ? normalizeTools(body.tools) : []
