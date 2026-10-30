@@ -324,7 +324,8 @@ function jsonResponse(value, status = 200) {
 async function nativeCompletion({ body, cookie, signal, modelKey }) {
   const stream = body.stream !== false
   const payload = nativePayload(body, modelKey)
-  // 每请求一个独立 session，避免同会话并发被上游互斥
+  // 每请求一个独立 session：实测同 session 并发 8 路也正常（无互斥、无串扰），
+  // 独立 session 只是为了不依赖任何服务端会话状态，代价为零。
   const sessionId = String(Date.now()) + String(Math.floor(Math.random() * 100)).padStart(2, "0")
 
   let runRes
