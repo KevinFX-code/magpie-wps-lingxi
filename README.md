@@ -27,6 +27,8 @@
   启动或登录后自动与 WPS 灵犀网页端 1:1 动态对齐最新模型列表（13+ 个主流模型），精准标注官方消耗倍率与 1M（1,048,576 tokens）超长上下文。
 - ⚡ **OpenAI 兼容 SSE 反代 (`auth.loader`)**  
   将通用的 `/v1/chat/completions` 请求转接至金山灵犀官方后端，自动维护会话会话生命周期，支持正文流式打字机与深度思考（`reasoning_content`）流式回传。
+- 🧰 **工具调用桥接 (`tools` → `tool_calls`)**  
+  灵犀后端是聊天应用而非函数调用 API，模型会把调用写在正文里（`<|FunctionCallBegin|>[{"name":…,"parameters":…}]<|FunctionCallEnd|>`）。插件把请求里的 `tools` 压进提示词，再把这段信封流式翻译成标准 OpenAI `tool_calls`（含 `finish_reason: "tool_calls"`），工具循环因此可以正常跑通。设置 `MAGPIE_LINGXI_TOOL_BRIDGE=0` 可关闭。
 - 🔑 **开箱即用鉴权 (`auth.methods`)**  
   支持 Magpie 客户端内弹窗直接粘贴 `wps_sid`，亦支持自动拉起浏览器进行网页引导授权。
 

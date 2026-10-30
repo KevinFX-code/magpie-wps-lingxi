@@ -12,4 +12,5 @@ jobs:
           node-version: '22'
       - run: node --check index.mjs
       - run: node --test review.test.mjs
+      - run: node --test tools.test.mjs
 
