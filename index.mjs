@@ -22,6 +22,17 @@ const TOOL_CALL_END = "<|FunctionCallEnd|>"
 const TOOL_CALL_MAX_BUFFER = 1 << 20
 const TOOL_BRIDGE_ENABLED = process.env.MAGPIE_LINGXI_TOOL_BRIDGE !== "0"
 
+// 对齐灵犀网页端的原生请求字段（从线上 bundle 里还原）：
+//   question / expect_model / thinking / with_mcp / with_expert / user_input
+// thinking 的原生取值是 "auto" | "disabled"；reasoning_effort 才是 0/1/2。
+const THINKING_OVERRIDE = process.env.MAGPIE_LINGXI_THINKING || ""
+const WITH_MCP = process.env.MAGPIE_LINGXI_WITH_MCP === "1"
+
+function thinkingModeFor(effort) {
+  if (THINKING_OVERRIDE === "auto" || THINKING_OVERRIDE === "disabled") return THINKING_OVERRIDE
+  return effort === "0" ? "disabled" : "auto"
+}
+
 function contentToText(content) {
   if (typeof content === "string") return content
   if (Array.isArray(content)) {
@@ -641,8 +652,13 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             async function sendCompletions(sessId) {
               const payload = {
                 question,
+                // 网页端用 expect_model 指定模型；model 只是兼容旧行为的别名
+                expect_model: requestedModel,
                 model: requestedModel,
                 user_input: { text: question },
+                thinking: thinkingModeFor(normalizedEffort),
+                with_mcp: WITH_MCP,
+                with_expert: false,
               }
               if (normalizedEffort !== undefined) payload.reasoning_effort = normalizedEffort
 

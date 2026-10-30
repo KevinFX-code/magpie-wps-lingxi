@@ -31,6 +31,8 @@
   灵犀后端是聊天应用而非函数调用 API，模型会把调用写在正文里（`<|FunctionCallBegin|>[{"name":…,"parameters":…}]<|FunctionCallEnd|>`）。插件把请求里的 `tools` 压进提示词，再把这段信封流式翻译成标准 OpenAI `tool_calls`（含 `finish_reason: "tool_calls"`），工具循环因此可以正常跑通。设置 `MAGPIE_LINGXI_TOOL_BRIDGE=0` 可关闭。
 - 🧭 **结构化提示词 (`SYSTEM` / `TOOLS` / 历史 / `User`)**  
   上游只收一个 `question` 字符串，插件按 `SYSTEM → TOOLS → 历史 → User` 分段压平：system 提到最前并去重、工具清单独立成段、历史严格按时间顺序（工具结果回灌时自动补“继续”），避免系统指令被当成“引用的历史文本”。
+- 🧬 **对齐网页端原生调用 (`expect_model` / `thinking` / `with_mcp`)**  
+  请求体按灵犀网页端的真实字段构造：`question`、`expect_model`、`thinking`（`auto`/`disabled`，由 `reasoning_effort` 推导）、`with_mcp`、`with_expert`、`user_input`，并沿用 `X-Cc-Version` / `X-Client-Type` / `X-Cc-Entrance` 头。`MAGPIE_LINGXI_THINKING=auto|disabled` 可强制思考档位，`MAGPIE_LINGXI_WITH_MCP=1` 可打开服务端 MCP 工具。
 - 🔑 **开箱即用鉴权 (`auth.methods`)**  
   支持 Magpie 客户端内弹窗直接粘贴 `wps_sid`，亦支持自动拉起浏览器进行网页引导授权。
 
