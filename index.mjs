@@ -5,9 +5,10 @@
 import { createServer } from "node:http"
 import { createHash } from "node:crypto"
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
-import { join } from "node:path"
-import { tmpdir } from "node:os"
+import { join, dirname } from "node:path"
+import { tmpdir, userInfo } from "node:os"
 import { exec, spawn } from "node:child_process"
+import { fileURLToPath } from "node:url"
 
 const PROVIDER = "wps-lingxi"
 // 两条平面（别混）：
@@ -17,6 +18,7 @@ const PROVIDER = "wps-lingxi"
 //     tools / tool_calls 真可用（2026-10-28 一手实测，见 Agent2Providers feat/lingxi-provider）。
 // 任务 / 余额 / 目录仍在 kdocs.cn；agent-runtime 在 wps.cn 上，先试它、不行再回落老域名。
 const LINGXI_BASE = "https://lingxi.kdocs.cn"
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const AGENT_BASE = "https://lingxi.wps.cn"
 const AGENT_SESSIONS_PATH = "/api/aioffice/v1/cowork/sessions"
 const AGENT_RUNS_PATH = "/api/public/v1/credits/runs"
@@ -889,13 +891,501 @@ async function claimTask(cookie, base, key, date) {
 }
 
 // 领取日期优先取任务里「今天可领」那一档（+08 口径由上游给，别自己算）。
+// ── 灵犀任务中心：把「做不出来」的一次性任务做出来 ──────────────────────────
+//
+// 任务中心除了每日签到，还有三个一次性任务：
+//   try_expert_mode    「完整体验一次灵犀专家模式」  200 智点
+//   try_group_chat     「体验一次群聊功能」            400 智点
+//   use_lingxi_client  「使用灵犀客户端」              800 智点
+//
+// 上游已有的「只领上游 claimable 的」逻辑只能领回**已经完成**的任务；
+// 而这三个任务需要**先去做**。服务端判定「专家模式 / 客户端」靠的不是某个
+// 请求头，而是**经 AI Gateway 发出的那一次真实客户端对话**这一信号 ——
+// 纯 HTTP 模拟（agent-runtime 平面、老平面 aigc v3、各种 cowork 会话）
+// 实测都无法让任务状态翻转。
+//
+// 所以这里复用客户端自己的内核 app-server：以 stdio JSON-RPC 把它拉起来，
+// 发一次最小对话（"hi"），行为与真客户端完全一致；随后复用该会话建群。
+//
+// app-server 由官方 CDN 公开分发，插件按需自动下载并校验 sha256：
+//   node scripts/fetch-app-server.mjs
+// （仓库里不放任何二进制，vendor/ 已 gitignore）
+//
+// 协议（客户端 app-server:transport 日志逆向）：
+//   initialize → initialized(notify) → account/login/start
+//   → session/start → run/start → (run.end / stream.end)
+//
+// ⚠️ 两个实测踩过的坑：
+//   1) 建群要求会话 execution_status=completed，而这个状态是服务端在
+//      app-server **进程存活期间**落的 —— 进程提前退出会让会话永远停在
+//      running，建群接口恒返回 400。所以 stop() 要等建群做完再调用。
+//   2) 拿到 run.end 之后还要轮询会话详情，等状态真正落库。
+
+const APP_SERVER_DIR = join(PLUGIN_DIR, "vendor", "app-server")
+const APP_SERVER_EXE = join(APP_SERVER_DIR, "service", "lingxi.exe")
+const APP_SERVER_PROTOCOL = "2026-08-13"
+const APP_SERVER_CLIENT_NAME = "wps-lingxi-desktop"
+// 最低倍率模型（一次 "hi" 约 1 智点）
+const APP_SERVER_MODEL = "qwen3.8_flash"
+const APP_SERVER_VERSIONS_API = "https://lingxi.kdocs.cn/api/aioffice/v1/cowork/app-server/versions"
+const APP_SERVER_TIMEOUT_MS = 90000
+
+function appServerAvailable() {
+  return process.platform === "win32" && existsSync(APP_SERVER_EXE)
+}
+
+/**
+ * 首次需要时自动下载官方 app-server（公开 CDN，无需鉴权）。
+ * 失败不抛异常 —— 只是让「客户端类任务」跳过，其余功能照常。
+ */
+let appServerFetchPromise = null
+async function ensureAppServer() {
+  // app-server 只提供 Windows 平台产物，其他平台直接跳过（不去白下载 90MB）
+  if (process.platform !== "win32") return false
+  if (appServerAvailable()) return true
+  if (appServerFetchPromise) {
+    try {
+      return await appServerFetchPromise
+    } catch {
+      return false
+    }
+  }
+  appServerFetchPromise = (async () => {
+    try {
+      const res = await fetch(APP_SERVER_VERSIONS_API, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(30000),
+      })
+      if (!res.ok) return false
+      const json = await res.json().catch(() => ({}))
+      const win = json?.data?.app_server?.platforms?.win
+      if (!win?.download_url) return false
+
+      const { mkdirSync, createWriteStream, statSync, rmSync, renameSync, readFileSync, readdirSync, copyFileSync } = await import("node:fs")
+      const { createHash } = await import("node:crypto")
+      const { Readable } = await import("node:stream")
+      const { pipeline } = await import("node:stream/promises")
+
+      mkdirSync(APP_SERVER_DIR, { recursive: true })
+      const zipPath = join(APP_SERVER_DIR, "app-server.zip")
+      const dl = await fetch(win.download_url, { signal: AbortSignal.timeout(600000) })
+      if (!dl.ok) return false
+      await pipeline(Readable.fromWeb(dl.body), createWriteStream(zipPath + ".part"))
+      if (win.hash) {
+        const got = createHash("sha256").update(readFileSync(zipPath + ".part")).digest("hex")
+        if (got !== win.hash) {
+          rmSync(zipPath + ".part", { force: true })
+          return false
+        }
+      }
+      renameSync(zipPath + ".part", zipPath)
+
+      // 解压：优先用系统 tar（Win10+ 自带 bsdtar），否则 7z / unzip
+      const extractDir = join(APP_SERVER_DIR, "_extract")
+      rmSync(extractDir, { recursive: true, force: true })
+      mkdirSync(extractDir, { recursive: true })
+      const { spawn } = await import("node:child_process")
+      const candidates = [
+        { cmd: "tar", args: ["-xf", zipPath, "-C", extractDir] },
+        { cmd: "7z", args: ["x", `-o${extractDir}`, "-y", zipPath] },
+        { cmd: "7za", args: ["x", `-o${extractDir}`, "-y", zipPath] },
+        { cmd: "unzip", args: ["-q", zipPath, "-d", extractDir] },
+      ]
+      let unzipped = false
+      for (const c of candidates) {
+        unzipped = await new Promise((res) => {
+          const p = spawn(c.cmd, c.args, { stdio: "ignore", shell: process.platform === "win32" })
+          p.on("error", () => res(false))
+          p.on("exit", (code) => res(code === 0))
+        })
+        if (unzipped) break
+      }
+      rmSync(zipPath, { force: true })
+      if (!unzipped) {
+        rmSync(extractDir, { recursive: true, force: true })
+        return false
+      }
+
+      // zip 内可能是 app-server/service/lingxi.exe，也可能是 service/lingxi.exe
+      let src = join(extractDir, "app-server", "service", "lingxi.exe")
+      if (!existsSync(src)) {
+        const found = readdirSync(extractDir)
+          .map((d) => join(extractDir, d, "service", "lingxi.exe"))
+          .find((p) => existsSync(p))
+        if (!found) {
+          rmSync(extractDir, { recursive: true, force: true })
+          return false
+        }
+        src = found
+      }
+      const destDir = join(APP_SERVER_DIR, "service")
+      mkdirSync(destDir, { recursive: true })
+      copyFileSync(src, join(destDir, "lingxi.exe"))
+      rmSync(extractDir, { recursive: true, force: true })
+      return statSync(join(destDir, "lingxi.exe")).size > 0
+    } catch {
+      return false
+    }
+  })()
+  return appServerFetchPromise
+}
+
+/**
+ * 驱动 app-server 跑一次对话。
+ * 返回 { ok, sessionId, error, stop } —— stop() 必须在建群完成后调用。
+ */
+async function runAppServerChat(cookie, base) {
+  const sid = extractSid(cookie)
+  if (!sid) return { ok: false, sessionId: "", error: "无 wps_sid" }
+  if (!(await ensureAppServer())) {
+    return { ok: false, sessionId: "", error: "app-server 不可用" }
+  }
+
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs")
+
+  let dataDir = ""
+  let proc = null
+  const cleanup = () => {
+    try { proc?.kill() } catch {}
+    if (dataDir) { try { rmSync(dataDir, { recursive: true, force: true }) } catch {} }
+  }
+
+  try {
+    dataDir = mkdtempSync(join(tmpdir(), "magpie-lingxi-as-"))
+    const authPath = join(dataDir, "auth.json")
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "wps_sid", wps_sid: { value: sid } }))
+
+    proc = spawn(
+      APP_SERVER_EXE,
+      ["-stdin", "-auth-file", authPath, "-data-dir", dataDir, "-client-type", "lingxi_claw"],
+      { stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
+    )
+
+    // ── JSON-RPC over stdio ──
+    let buf = ""
+    const waiters = new Map()
+    let resolveEnd = null
+    const endPromise = new Promise((r) => { resolveEnd = r })
+
+    proc.stdout.setEncoding("utf8")
+    proc.stdout.on("data", (chunk) => {
+      buf += chunk
+      let i
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim()
+        buf = buf.slice(i + 1)
+        if (!line) continue
+        let msg
+        try { msg = JSON.parse(line) } catch { continue }
+        if (msg.id && waiters.has(msg.id)) {
+          waiters.get(msg.id)(msg)
+          waiters.delete(msg.id)
+        } else if (msg.method === "run.end" || msg.method === "stream.end") {
+          resolveEnd?.()
+        }
+      }
+    })
+    proc.stderr.resume()
+
+    let seq = 0
+    const rpc = (method, params, timeoutMs = 60000) =>
+      new Promise((resolve, reject) => {
+        const id = "s:magpie_" + ++seq
+        const timer = setTimeout(() => {
+          if (waiters.has(id)) { waiters.delete(id); reject(new Error(method + " 超时")) }
+        }, timeoutMs)
+        waiters.set(id, (m) => { clearTimeout(timer); resolve(m) })
+        try {
+          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n")
+        } catch (e) {
+          clearTimeout(timer)
+          waiters.delete(id)
+          reject(e)
+        }
+      })
+    const notify = (method, params) => {
+      try { proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n") } catch {}
+    }
+
+    const deviceId = await appServerDeviceId()
+
+    // ① initialize
+    const init = await rpc("initialize", {
+      protocol_version: APP_SERVER_PROTOCOL,
+      client_info: { name: APP_SERVER_CLIENT_NAME, version: "1.3.31" },
+      capabilities: { bash_approval: false, skill_management: false, timer_task: true, auth_refresh: true },
+      device_id: deviceId,
+      device_name: appServerDeviceName(),
+    })
+    if (init?.error) { cleanup(); return { ok: false, sessionId: "", error: "initialize 失败" } }
+    notify("initialized", {})
+
+    // ② account/login/start（冲突 = 已登录，可忽略）
+    try { await rpc("account/login/start", { auth_mode: "wps_sid", wps_sid: sid }, 30000) } catch {}
+
+    // ③ session/start
+    const sess = await rpc("session/start", {
+      client_type: "lingxi_claw",
+      session_type: "cowork_client",
+      workspace_dir: "magpie-lingxi",
+      official_skills_dir: "official_skills",
+      user_skills_dir: "user_skills",
+      target_skills_dir: "target_skills",
+      env: {
+        device_id: deviceId,
+        device_name: appServerDeviceName(),
+        skills: { dir: "target_skills", list: [] },
+      },
+    })
+    const sessionId = String(sess?.result?.session_id ?? "")
+    if (!sessionId) { cleanup(); return { ok: false, sessionId: "", error: "session/start 失败" } }
+
+    // ④ run/start —— 发一句最短的 "hi"
+    await rpc("run/start", {
+      session_id: sessionId,
+      agent_input: {
+        text: "hi",
+        files: [],
+        file_ids: [],
+        expect_model: APP_SERVER_MODEL,
+        refs: [],
+        webpage_edit_selections: [],
+        permission_mode: "default",
+        reasoning_effort: "low",
+        current_mode: "agent",
+        browser_plugin_enabled: false,
+      },
+      model: { provider: "lingxi", model_name: APP_SERVER_MODEL },
+    }, APP_SERVER_TIMEOUT_MS)
+
+    // ⑤ 等对话结束
+    await Promise.race([endPromise, new Promise((r) => setTimeout(r, APP_SERVER_TIMEOUT_MS))])
+
+    // ⑥ 等服务端落库 execution_status=completed（此时进程必须还活着）
+    const done = await waitSessionCompleted(sessionId, cookie, base)
+    if (!done) {
+      cleanup()
+      return { ok: false, sessionId, error: "会话未完成" }
+    }
+
+    // 注意：这里**不能**立刻结束进程。execution_status=completed 是服务端在
+    // app-server 存活期间落的，进程提前死 → 会话永远停在 running → 建群恒 400。
+    return { ok: true, sessionId, error: "", stop: cleanup }
+  } catch (error) {
+    cleanup()
+    return { ok: false, sessionId: "", error: String(error?.message || error).slice(0, 120) }
+  }
+}
+
+/** 轮询会话详情，直到 execution_status 变成 completed（建群接口的硬性前提） */
+async function waitSessionCompleted(sessionId, cookie, base, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${base}/api/public/v1/sessions/${sessionId}`, {
+        headers: basicHeaders(cookie, base),
+        signal: AbortSignal.timeout(15000),
+      })
+      if (response.ok) {
+        const payload = await response.json().catch(() => ({}))
+        if (payload?.data?.execution_status === "completed" || payload?.data?.terminal_status === "completed") return true
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 2000))
+  }
+  return false
+}
+
+/** 从会话列表里挑一个已完成的会话，用于建群（无新对话任务时的兜底） */
+async function pickGroupChatSession(cookie, base) {
+  try {
+    const response = await fetch(
+      `${base}/api/public/v1/session_list?limit=30&exclude_agent=false&session_types=cowork_client&session_types=cowork_web&session_types=chat`,
+      { headers: basicHeaders(cookie, base), signal: AbortSignal.timeout(20000) },
+    )
+    if (!response.ok) return ""
+    const payload = await response.json().catch(() => ({}))
+    const list = Array.isArray(payload?.data?.list) ? payload.data.list : []
+    for (const session of list) {
+      const id = String(session?.session_id ?? "")
+      if (!id) continue
+      try {
+        const detail = await fetch(`${base}/api/public/v1/sessions/${id}`, {
+          headers: basicHeaders(cookie, base),
+          signal: AbortSignal.timeout(15000),
+        })
+        if (!detail.ok) continue
+        const data = await detail.json().catch(() => ({}))
+        if (data?.data?.execution_status === "completed" || data?.data?.terminal_status === "completed") return id
+      } catch {}
+    }
+    return ""
+  } catch {
+    return ""
+  }
+}
+
+// 设备标识：客户端用 64 位 hex 的 device identity，用 sid 派生保证同账号稳定
+let appServerDeviceIdCache = ""
+async function appServerDeviceId() {
+  if (appServerDeviceIdCache) return appServerDeviceIdCache
+  const { createHash } = await import("node:crypto")
+  appServerDeviceIdCache = createHash("sha256").update("magpie-lingxi-device").digest("hex")
+  return appServerDeviceIdCache
+}
+
+function appServerDeviceName() {
+  try {
+    return userInfo().username || "magpie"
+  } catch {
+    return "magpie"
+  }
+}
+
+/** 创建群聊（group_chat 任务）。返回 { ok, channelId, error } */
+async function createGroupChatWith(cookie, base, sessionId) {
+  try {
+    const response = await fetch(`${base}/api/imchat/v1/channels`, {
+      method: "POST",
+      headers: { ...basicHeaders(cookie, base), "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, expect_model: "plan_pro" }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const text = await response.text().catch(() => "")
+    if (!response.ok) return { ok: false, error: `建群 HTTP ${response.status}` }
+    let payload = {}
+    try { payload = JSON.parse(text) } catch {}
+    const channelId = String(payload?.data?.channel_id ?? "")
+    return channelId ? { ok: true, channelId } : { ok: false, error: "无 channel_id" }
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e).slice(0, 80) }
+  }
+}
+
+/** 解散刚建的群，避免留垃圾群 */
+async function deleteGroupChat(cookie, base, channelId) {
+  if (!channelId) return
+  try {
+    await fetch(`${base}/api/imchat/v1/channels/${channelId}`, {
+      method: "DELETE",
+      headers: basicHeaders(cookie, base),
+      signal: AbortSignal.timeout(15000),
+    })
+  } catch {}
+}
+
+/**
+ * 把「做不出来」的一次性任务做出来：
+ *   一次 app-server 对话 → 同时带出「专家模式」+「客户端」两个任务
+ *   复用该会话建群 → 解散 → 重拉任务 → 领取所有 claimable
+ * 余额为 0 时不做任何消耗性动作。
+ * 返回 { bonus, message }。
+ */
+async function completeOneTimeTasks(cookie, base, tasks) {
+  const msg = []
+  let bonus = 0
+
+  const claimNow = []
+  let needExpert = false
+  let needGroup = false
+  let needClient = false
+  for (const task of tasks || []) {
+    if (task?.type !== "one_time" || !task?.task_key) continue
+    if (task.status === "claimable") claimNow.push(task.task_key)
+    else if (task.status === "incomplete") {
+      if (task.action === "expert_mode") needExpert = true
+      else if (task.action === "group_chat") needGroup = true
+      else if (task.action === "download_client") needClient = true
+    }
+  }
+
+  const bal = await balanceTotal(cookie, base)
+  const poor = bal !== null && bal <= 0
+  if (poor && (needExpert || needClient || needGroup)) msg.push("余额不足，跳过需消耗的任务")
+
+  let sessionId = ""
+  let stopAppServer = null
+
+  if ((needExpert || needClient) && !poor) {
+    const chat = await runAppServerChat(cookie, base)
+    sessionId = chat.sessionId || ""
+    if (chat.ok) {
+      stopAppServer = chat.stop
+      msg.push("客户端对话 ✓")
+    } else {
+      msg.push(`对话失败(${chat.error || "?"})`)
+    }
+  }
+
+  if (needGroup && !poor) {
+    let sid = sessionId
+    if (!sid) {
+      sid = await pickGroupChatSession(cookie, base)
+      if (sid) msg.push("取历史会话 ✓")
+    }
+    if (sid) {
+      const group = await createGroupChatWith(cookie, base, sid)
+      if (group.ok) {
+        msg.push("建群 ✓")
+        await deleteGroupChat(cookie, base, group.channelId)
+      } else {
+        msg.push(`建群失败(${group.error || "?"})`)
+      }
+    } else {
+      msg.push("建群失败（无可用会话）")
+    }
+  }
+
+  // app-server 要活到建群结束
+  try { stopAppServer?.() } catch {}
+
+  // 重拉任务，领取所有 claimable（含刚被动作带出来的）
+  const after = await listTasks(cookie, base)
+  const toClaim = after
+    ? after.filter((t) => t?.task_key && t.status === "claimable").map((t) => t.task_key)
+    : claimNow
+  const got = []
+  for (const key of toClaim) {
+    try {
+      const claim = await claimTask(cookie, base, key)
+      const value = Number(claim?.data?.reward_amount ?? 0)
+      if (value > 0) {
+        bonus += value
+        got.push(key)
+      }
+    } catch {}
+  }
+  if (bonus > 0) msg.unshift(`一次性任务 ${got.join("/")} +${bonus} 智点`)
+  return { bonus, message: msg.join("；") }
+}
+
+/** 查询任务列表（用于领取前重拉状态） */
+async function listTasks(cookie, base) {
+  try {
+    const response = await fetch(`${base}/api/public/v1/tasks`, {
+      headers: basicHeaders(cookie, base),
+      signal: AbortSignal.timeout(20000),
+    })
+    if (!response.ok) return null
+    const payload = await response.json().catch(() => ({}))
+    return Array.isArray(payload?.data?.tasks) ? payload.data.tasks : null
+  } catch {
+    return null
+  }
+}
+
 function claimDate(daily) {
+  const today = getTodayString()
   const days = daily?.extra?.check_in_days
   if (Array.isArray(days)) {
+    // 上游实际只会给 claimed / locked 两种状态，没有 "available"，
+    // 所以先按**今天**去匹配那一档；匹配不到再看有没有显式 available 的。
+    const hit = days.find((day) => day?.date === today && typeof day?.date === "string")
+    if (hit) return hit.date
     const available = days.find((day) => day?.status === "available" && typeof day?.date === "string")
     if (available) return available.date
   }
-  return getTodayString()
+  return today
 }
 
 // 动态拉取网页端可用模型
@@ -1018,22 +1508,15 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               : { outcome: "done", message: "今日已签到（上游幂等，余额未变化）", ...(streak ? { streak } : {}) }
           }
 
-          // 一次性任务：只领上游自己标成 claimable 的（动作没做的 claim 必被拒）。
-          let bonus = 0
-          const keys = []
-          for (const task of tasks) {
-            if (task?.type !== "one_time" || task?.status !== "claimable" || !task?.task_key) continue
-            try {
-              const claim = await claimTask(cookie, base, task.task_key)
-              const got = Number(claim?.data?.reward_amount ?? task.reward_amount ?? 0)
-              if (Number.isFinite(got) && got > 0) bonus += got
-              keys.push(task.task_key)
-            } catch {}
-          }
-          if (bonus > 0) {
-            outcome.credit = Number(outcome.credit || 0) + bonus
+          // 一次性任务：先把「做不出来」的做出来（专家模式 / 群聊 / 客户端），
+          // 再把上游所有 claimable 的一次性任务领回。
+          const auto = await completeOneTimeTasks(cookie, base, tasks)
+          if (auto.bonus > 0) {
+            outcome.credit = Number(outcome.credit || 0) + auto.bonus
             outcome.outcome = "claimed"
-            outcome.message = `一次性任务 ${keys.join("/")} +${bonus} 智点`
+          }
+          if (auto.message) {
+            outcome.message = outcome.message ? `${outcome.message}；${auto.message}` : auto.message
           }
           return outcome
         } catch (error) {
