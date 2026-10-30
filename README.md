@@ -92,8 +92,10 @@ npm install "/path/to/magpie-wps-lingxi"
 magpie plugin login wps-lingxi
 ```
 或直接在 **Magpie 桌面客户端** 的 Provider 管理面板中找到 **WPS 灵犀** 点击 **Login**：
-1. **直接粘贴**：打开 [lingxi.kdocs.cn](https://lingxi.kdocs.cn/)，按 `F12` -> 【Application/应用】->【Cookies】，复制 `wps_sid` 的值粘贴提交；
+1. **直接粘贴**：打开 [lingxi.kdocs.cn](https://lingxi.kdocs.cn/)，按 `F12` -> 【Application/应用】->【Cookies】，复制 `wps_sid` 的值粘贴提交；也可以整段复制（`wps_sid=…; uid=…`），插件会自动挑出需要的字段；
 2. **网页授权**：点击后将自动弹出本地向导页面，按提示粘贴确认即可完成绑定。
+
+> 多账号：凭据按 `uid`（没有则取 `wps_sid` 尾部）区分，第二个账号不会覆盖第一个。
 
 ### 2. 查看配额与签到
 - 查看当前可用智点余额：
