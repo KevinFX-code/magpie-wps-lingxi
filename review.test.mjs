@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { WPSLingxiAuthPlugin } from './index.mjs'
-const plugin = await WPSLingxiAuthPlugin()
+import { makePlugin } from './test-helpers.mjs'
+const plugin = await makePlugin()
 const auth = async () => ({cookie:'wps_sid=mock'})
 const loader = await plugin.auth.loader(auth)
 const nativeFetch = globalThis.fetch

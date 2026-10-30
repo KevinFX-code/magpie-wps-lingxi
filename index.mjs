@@ -223,8 +223,73 @@ const DEFAULT_MODELS = [
 const NATIVE_BASE = "https://cowork.wps.cn"
 const NATIVE_MODE = (process.env.MAGPIE_LINGXI_MODE || "auto").toLowerCase() // auto | native | legacy
 
-/** 原生模型目录：key -> { key, name, desc }；由 provider.models() 填充 */
+/** 原生模型目录：key -> { key, name, desc }；由 provider.models() 或 loader 懒加载填充 */
 const nativeCatalog = new Map()
+
+/** 网页聊天目录：key -> 模型描述；用来判定「这个 key 走哪条路」，也给模型表兜底 */
+const webCatalog = new Map()
+
+// plan_* 是「模式」不是模型：原生计费 run 不认它们（实测 HTTP 400 InvalidArgument），
+// 但网页通路认。所以它们必须固定走网页通路，不能因为出现在原生目录里就路由到原生。
+const PLAN_KEYS = new Set(["plan_pro", "plan_max"])
+
+const warned = new Set()
+function warnOnce(message) {
+  if (warned.has(message)) return
+  warned.add(message)
+  console.warn(`[magpie-wps-lingxi] ${message}`)
+}
+
+/**
+ * 被原生计费接口拒绝过的 key。cowork 目录里列了 6 个模型，但实测只有
+ * deepseek-v4-* / kimi-k2.6 能领到 run_id；GLM-5.1、GLM-5-Turbo、plan_*
+ * 一律 400 InvalidArgument。它们在网页通路上都能正常跑，所以首次被拒后
+ * 记住并降级，而不是把这个 key 变成「一点就报错」。
+ */
+const nativeRejected = new Set()
+
+/**
+ * 单模型路由判定：原生优先，plan_* 例外，目录里没有的 key 走网页兜底。
+ * 两条通路的 usage / tool_calls / reasoning 语义完全不同，路由必须是可解释的。
+ */
+function routeFor(modelKey) {
+  if (NATIVE_MODE === "legacy") return "legacy"
+  if (PLAN_KEYS.has(modelKey)) return "legacy"
+  if (nativeRejected.has(modelKey)) return "legacy"
+  if (nativeCatalog.has(modelKey)) return "native"
+  if (NATIVE_MODE === "native" && nativeCatalog.size) return "native"
+  return "legacy"
+}
+
+function routeHeaders(route, modelKey) {
+  return { "X-Lingxi-Route": route, "X-Lingxi-Model": modelKey }
+}
+
+function withRoute(res, route, modelKey) {
+  try {
+    const headers = new Headers(res.headers)
+    for (const [k, v] of Object.entries(routeHeaders(route, modelKey))) headers.set(k, v)
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+  } catch {
+    return res
+  }
+}
+
+let catalogWarm = null
+/** models() 没跑过（或跑失败）时，loader 自己把原生目录预热一次 */
+function warmNativeCatalog(cookie, signal) {
+  if (nativeCatalog.size) return Promise.resolve()
+  if (!catalogWarm) {
+    catalogWarm = fetchNativeCatalog(cookie, signal)
+      .catch((error) => {
+        warnOnce(`原生模型目录不可用，本次按网页通路处理：${error.message}`)
+      })
+      .finally(() => {
+        catalogWarm = null
+      })
+  }
+  return catalogWarm
+}
 
 function nativeHeaders(cookie, extra = {}) {
   return {
@@ -500,13 +565,17 @@ function configModels() {
   )
 }
 
-function modelOf(provider, m) {
-  const isReasoning = !!(m.reasoning || (m.reasoning_efforts && m.reasoning_efforts.length > 0))
+function modelOf(provider, m, opts = {}) {
+  const route = opts.route === "native" ? "native" : "legacy"
+  // 网页通路实测不吐 reasoning 流（4 个模型 × 2 档位全为 0 帧），只有原生通路
+  // 才有真实 reasoning_content —— 所以推理档位只在原生通路上暴露，避免假装支持。
+  const isReasoning = route === "native" && !!(m.reasoning || (m.reasoning_efforts && m.reasoning_efforts.length > 0))
   const multiplierText = m.multiplier ? ` [${m.multiplier}]` : ""
+  const routeText = route === "native" ? " · 原生" : " · 网页"
   return {
     id: m.id || m.key,
     providerID: provider.id,
-    name: `${m.name}${multiplierText}`,
+    name: `${m.name}${multiplierText}${routeText}`,
     api: { id: m.id || m.key, url: `${LINGXI_BASE}/api`, npm: NPM },
     status: "active",
     headers: {},
@@ -592,6 +661,10 @@ async function fetchLiveModels(cookie) {
       }
     }
 
+    if (list.length) {
+      webCatalog.clear()
+      for (const m of list) webCatalog.set(m.id, m)
+    }
     return list
   } catch {
     return []
@@ -615,28 +688,41 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
     provider: {
       id: PROVIDER,
       // 原生通路用 cowork 的模型目录（key/name/desc），网页通路用灵犀网页的模型表
+      // 模型表是「原生 ∪ 网页」的并集：原生目录质量高但只有 6 个模型，
+      // 网页目录有 11 个（Kimi K3.1 Pro、Qwen3.8、MiMo…只在网页里）。
+      // 两个都列出来，名字后缀标明走哪条通路，路由由 routeFor() 决定。
       async models(provider, { auth } = {}) {
         const cookie = resolveCookie(auth)
+        const out = {}
+
         if (cookie && NATIVE_MODE !== "legacy") {
           try {
             const list = await fetchNativeCatalog(cookie)
-            return Object.fromEntries(list.map((m) => [m.key, modelOf(provider, {
-              id: m.key,
-              name: m.name,
-              context: 1048576,
-              reasoning: true,
-            })]))
-          } catch {
-            // 原生目录不可用 → 回落到网页模型表，loader 也会走网页通路
+            for (const m of list) {
+              out[m.key] = modelOf(provider, {
+                id: m.key,
+                name: m.name,
+                desc: m.desc,
+                context: 1048576,
+                reasoning: true,
+              }, { route: routeFor(m.key) })
+            }
+          } catch (error) {
+            // 原生目录挂了不能把整张表清空：网页目录仍然可用，loader 也会回落
+            warnOnce(`原生模型目录不可用，本次只列出网页通路模型：${error.message}`)
           }
         }
+
         if (cookie) {
           const live = await fetchLiveModels(cookie)
-          if (live.length) {
-            return Object.fromEntries(live.map((m) => [m.id, modelOf(provider, m)]))
+          for (const m of live) {
+            if (out[m.id]) continue // 原生目录已覆盖，保留原生路由
+            out[m.id] = modelOf(provider, m, { route: routeFor(m.id) })
           }
         }
-        return Object.fromEntries(DEFAULT_MODELS.map((m) => [m.id, modelOf(provider, m)]))
+
+        if (Object.keys(out).length) return out
+        return Object.fromEntries(DEFAULT_MODELS.map((m) => [m.id, modelOf(provider, m, { route: "legacy" })]))
       },
     },
 
@@ -832,18 +918,40 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               requestedModel = "deepseek-v4.1-flash"
             }
 
-            // 原生通路优先：模型在 cowork 目录里就走 Agent Runtime（原生 messages/tools），
-            // 否则回落到下面 0.1.x 的网页聊天通路。目录由 provider.models() 预热。
-            if (NATIVE_MODE !== "legacy" && cookie) {
-              const isNative = nativeCatalog.has(requestedModel) || NATIVE_MODE === "native"
-              if (isNative) {
-                try {
-                  return await nativeCompletion({ body, cookie, signal, modelKey: requestedModel })
-                } catch (error) {
-                  signal?.throwIfAborted()
-                  return errorResponse(`WPS 灵犀原生接口异常: ${error.message}`)
-                }
+            // 原生通路优先，但路由表可能还没预热（models() 没跑过或跑失败过）。
+            // 不懒加载的话，所有模型都会静默落到网页通路 —— 而两条通路的
+            // usage / tool_calls / reasoning 语义完全不同，静默降级无法排查。
+            if (NATIVE_MODE !== "legacy" && cookie && !nativeCatalog.size) {
+              await warmNativeCatalog(cookie, signal)
+            }
+
+            const route = routeFor(requestedModel)
+            if (route === "native") {
+              let nativeRes
+              try {
+                nativeRes = await nativeCompletion({ body, cookie, signal, modelKey: requestedModel })
+              } catch (error) {
+                signal?.throwIfAborted()
+                return errorResponse(`WPS 灵犀原生接口异常: ${error.message}`)
               }
+              // credits/runs 对「目录里有、但网关没给这个账号开通」的 key 统一回
+              // 400 InvalidArgument。这类 key 在网页通路上是能跑的，所以降级重试一次，
+              // 并记住它，后续直接走网页通路 —— 而不是让用户每次点都吃 400。
+              if (nativeRes.status === 400) {
+                const detail = await nativeRes.clone().text().catch(() => "")
+                if (detail.includes("InvalidArgument")) {
+                  nativeRejected.add(requestedModel)
+                  warnOnce(`模型 ${requestedModel} 被原生计费接口拒绝（InvalidArgument），本次改走网页通路`)
+                } else {
+                  return withRoute(nativeRes, "native", requestedModel)
+                }
+              } else {
+                return withRoute(nativeRes, "native", requestedModel)
+              }
+            }
+
+            if (!nativeCatalog.has(requestedModel) && !webCatalog.has(requestedModel) && !PLAN_KEYS.has(requestedModel)) {
+              warnOnce(`模型 ${requestedModel} 不在任何目录里，按网页通路处理`)
             }
 
             const tools = TOOL_BRIDGE_ENABLED ? normalizeTools(body.tools) : []
@@ -952,11 +1060,13 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 // 网页端用 expect_model 指定模型；model 只是兼容旧行为的别名
                 expect_model: requestedModel,
                 model: requestedModel,
-                user_input: { text: question },
                 thinking: thinkingModeFor(normalizedEffort),
                 with_mcp: WITH_MCP,
                 with_expert: false,
               }
+              // 以前这里还有 user_input: { text: question } —— 和 question 完全相同，
+              // 等于把整段压平后的提示发了两遍。实测上游只认 question、user_input 可省略
+              // （question 说 A、user_input.text 说 B 时模型回答 A；整个字段删掉也正常）。
               if (normalizedEffort !== undefined) payload.reasoning_effort = normalizedEffort
 
               return fetch(`${LINGXI_BASE}/api/aigc/v3/assistant/sessions/${sessId}/completions`, {
@@ -1160,7 +1270,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 ],
               }
               return new Response(JSON.stringify(openAiResponse), {
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", ...routeHeaders("legacy", requestedModel) },
               })
             }
 
@@ -1169,6 +1279,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 "Content-Type": "text/event-stream; charset=utf-8",
                 "Cache-Control": "no-cache",
                 Connection: "keep-alive",
+                ...routeHeaders("legacy", requestedModel),
               },
             })
           },

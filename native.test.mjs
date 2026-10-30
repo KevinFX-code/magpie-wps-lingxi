@@ -8,18 +8,24 @@ const nativeFetch = globalThis.fetch
 
 const SSE = `data: ${JSON.stringify({ type: 'text', data: 'ok' })}\n\ndata: ${JSON.stringify({ type: 'end' })}\n\n`
 
+// 0.2.1 起 loader 会在目录未预热时先拉一次原生目录；这里给一个不含被测模型的目录，
+// 让这些用例继续落在网页通路上。
+const CATALOG = { data: { models: [{ key: 'native-only-model', name: 'Native Only' }], plans: [] } }
+
 async function capture(body) {
   const calls = []
   globalThis.fetch = async (url, init) => {
     calls.push({ url, init })
+    if (url.includes('/sessions/plans')) return Response.json(CATALOG)
     if (url.endsWith('/sessions')) return Response.json({ data: { session_id: 's1' } })
     return new Response(SSE)
   }
   const res = await loader.fetch('https://mock/v1/chat/completions', { body: JSON.stringify(body) })
   await res.text()
-  const [, completion] = calls
+  const session = calls.find((c) => c.url.endsWith('/sessions'))
+  const completion = calls.find((c) => c.url.includes('/completions'))
   return {
-    session: calls[0],
+    session,
     completion,
     payload: JSON.parse(completion.init.body),
     headers: completion.init.headers,
@@ -44,7 +50,8 @@ test('native request shape', async (t) => {
       assert.equal(completion.init.method, 'POST')
       assert.equal(payload.expect_model, 'kimi-k3.1-pro')
       assert.equal(payload.question, 'User: hi')
-      assert.equal(payload.user_input.text, payload.question)
+      // 0.2.1: user_input.text 曾是 question 的完整副本，等于把提示发两遍，已移除
+      assert.equal(payload.user_input, undefined)
       assert.equal(payload.thinking, 'auto')
       assert.equal(payload.with_mcp, false)
       assert.equal(payload.with_expert, false)

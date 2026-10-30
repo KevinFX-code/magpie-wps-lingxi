@@ -24,7 +24,7 @@
 - 📊 **智点额度监控 (`auth.usage`)**  
   对齐 Magpie Quota 规范，在桌面端配额面板中实时显示剩余可用「智点」总额与最近算力到期时间。
 - 🔄 **动态同步模型目录 (`provider.models`)**  
-  启动或登录后自动对齐灵犀最新模型：原生通路读 `cowork` 的模型目录（含 `plan_pro` / `plan_max` 模式），网页通路回落到灵犀网页模型表（13+ 个，带倍率与 1M 上下文）。
+  **原生目录 ∪ 网页目录**一起列出（0.2.1 起）：原生 `cowork` 目录只有 6 个模型，网页目录有 11+ 个（Kimi K3.1 Pro、Qwen3.8、MiMo、Doubao…只在网页里）。模型名后缀 `· 原生` / `· 网页` 直接标明走哪条通路，不会出现「看着在列表里、其实走的是降级通路」。
 - 🧬 **原生 Agent Runtime（0.2 新增，推荐）**  
   走灵犀桌面客户端同款通路 `cowork.wps.cn/api/public/v1/agent-runtime/chat/completions`：**原生 `messages` / `tools` 进，原生 `tool_calls` / `reasoning_content` / `usage` 出**。不再压平提示词、不再从正文反解工具调用，工具循环与官方客户端一致，并带回真实 token 用量。每个请求先 `POST /api/public/v1/credits/runs` 领 `run_id` 再发起。
 - ⚡ **OpenAI 兼容 SSE 反代 (`auth.loader`)**  
@@ -34,7 +34,8 @@
 - 🧭 **结构化提示词 (`SYSTEM` / `TOOLS` / 历史 / `User`)**  
   网页通路只收一个 `question` 字符串，插件按 `SYSTEM → TOOLS → 历史 → User` 分段压平：system 提到最前并去重、工具清单独立成段、历史严格按时间顺序（工具结果回灌时自动补“继续”），避免系统指令被当成“引用的历史文本”。
 - 🧬 **对齐网页端原生调用 (`expect_model` / `thinking` / `with_mcp`)**  
-  网页通路的请求体按真实字段构造：`question`、`expect_model`、`thinking`（`auto`/`disabled`，由 `reasoning_effort` 推导）、`with_mcp`、`with_expert`、`user_input`，并沿用 `X-Cc-Version` / `X-Client-Type` / `X-Cc-Entrance` 头。`MAGPIE_LINGXI_THINKING=auto|disabled` 可强制思考档位，`MAGPIE_LINGXI_WITH_MCP=1` 可打开服务端 MCP 工具。
+  网页通路的请求体按真实字段构造：`question`、`expect_model`、`thinking`（`auto`/`disabled`，由 `reasoning_effort` 推导）、`with_mcp`、`with_expert`，并沿用 `X-Cc-Version` / `X-Client-Type` / `X-Cc-Entrance` 头。`MAGPIE_LINGXI_THINKING=auto|disabled` 可强制思考档位，`MAGPIE_LINGXI_WITH_MCP=1` 可打开服务端 MCP 工具。
+  > 0.2.1 起不再发 `user_input`：它原先等于整段 `question` 的副本，等于把提示词发两遍。实测上游只认 `question`（两者冲突时按 `question` 回答），删掉该字段行为不变，请求体直接减半。
 - 🔑 **开箱即用鉴权 (`auth.methods`)**  
   支持 Magpie 客户端内弹窗直接粘贴 `wps_sid`，亦支持自动拉起浏览器进行网页引导授权。
 
@@ -44,14 +45,30 @@
 
 | 通路 | 端点 | 输入 | 输出 |
 |---|---|---|---|
-| **native**（默认） | `cowork.wps.cn/…/agent-runtime/chat/completions` | 原生 `messages` + `tools` | 原生 `tool_calls` / `reasoning_content` / `usage` |
+| **native**（优先） | `cowork.wps.cn/…/agent-runtime/chat/completions` | 原生 `messages` + `tools` | 原生 `tool_calls` / `reasoning_content` / `usage` |
 | **legacy**（兜底） | `lingxi.kdocs.cn/…/assistant/sessions/{id}/completions` | 单个 `question` 文本 | 文本信封 → 插件反解 `tool_calls` |
+
+路由规则（0.2.1）：
+
+- 模型在 `cowork` 原生目录里 → **native**
+- `plan_pro` / `plan_max` → **legacy**。它们是「模式」不是模型，原生计费接口 `credits/runs` 会直接 `HTTP 400 InvalidArgument`；网页通路则正常
+- 只在网页目录里的模型（Kimi K3.1 Pro、Qwen3.8、MiMo…）→ **legacy**
+- 两边目录都没有的 key → legacy，并打印一次告警
+- **首次被拒自动降级**：`cowork` 目录列了 6 个模型，但实测只有 `deepseek-v4-*` / `kimi-k2.6` 能领到 `run_id`，`GLM-5.1` / `GLM-5-Turbo` 同样 400。这类 key 首次请求被拒后插件会记住它、自动改走网页通路（并打一条告警），不会让你每次点都吃 400
 
 模式由 `MAGPIE_LINGXI_MODE` 控制：
 
-- `auto`（默认）：模型在原生目录里走 native，否则走 legacy
-- `native`：强制 native（模型名必须是 `cowork` 目录里的 key）
+- `auto`（默认）：按上面的规则自动判定
+- `native`：强制 native（目录不可用时仍会回落，避免必然 400）
 - `legacy`：强制旧网页通路（0.1.x 行为）
+
+**怎么知道这次走的是哪条路？** 响应头带 `X-Lingxi-Route: native|legacy` 和 `X-Lingxi-Model: <key>`。
+
+> ⚠️ **两条通路的观测能力不对等，这是硬事实，不是配置问题：**
+> - `native`：有真实 `usage`，有 `reasoning_content`，工具调用是上游原生 `tool_calls`（id 形如 `call_ig65…`）
+> - `legacy`：**上游不返回任何 token 用量**（SSE 里没有 usage 帧），插件也不编造，所以客户端会显示 0；`reasoning_effort` 实测对 4 个模型 × 2 个档位都没有任何 reasoning 输出；工具调用是插件用 `Date.now()` 拼的伪 id（形如 `call_1793322354555_0`）
+>
+> 换句话说：**需要真实用量统计、需要思考过程、需要可靠的工具循环，就用带 `· 原生` 后缀的模型。** 带 `· 网页` 后缀的模型能跑，但只有网页聊天级别的能力。
 
 > 原生通路是客户端私有网关，非公开接口；若上游调整字段，插件会明确返回错误而不是静默降级。
 
@@ -132,35 +149,59 @@ magpie plugin login wps-lingxi
 
 ---
 
-## 📋 官方动态同步模型列表
+## 📋 模型列表
 
-插件与灵犀网页端保持 1:1 动态实时同步，默认支持的模型包括：
+模型表是**实时拉取**的，不写死；下面是 2026-10-30 实测的快照，用来对照「哪个模型走哪条通路」。
 
-| 模型标识 (Model ID) | 模型名称 | 上下文长度 | 智点倍率 | 深度思考 (Reasoning) |
-| :--- | :--- | :--- | :--- | :---: |
-| `wps-lingxi/deepseek-v4.1-flash` | DeepSeek V4.1 Flash | 1M (1,048,576) | ~0.12x | ✅ 支持 |
-| `wps-lingxi/deepseek-v4-flash-0731` | DeepSeek V4 Flash | 1M (1,048,576) | 0.09x | ✅ 支持 |
-| `wps-lingxi/deepseek-v4-pro-0813` | DeepSeek V4 Pro | 1M (1,048,576) | 0.40x | ✅ 支持 |
-| `wps-lingxi/kimi-k3` | Kimi-K3 | 1M (1,048,576) | 1.60x | ✅ 支持 |
-| `wps-lingxi/GLM-5.3` | GLM-5.3 | 1M (1,048,576) | ~0.75x | ✅ 支持 |
-| `wps-lingxi/GLM-5.3-Flash` | GLM-5.3-Flash | 1M (1,048,576) | ~0.11x | ✅ 支持 |
-| `wps-lingxi/qwen3.8_max` | Qwen3.8-Max | 1M (1,048,576) | ~0.80x | ✅ 支持 |
-| `wps-lingxi/qwen3.8_flash` | Qwen3.8-Flash | 1M (1,048,576) | ~0.08x | ✅ 支持 |
-| `wps-lingxi/minimax_m3` | MiniMax-M3 | 1M (1,048,576) | 0.20x | ❌ |
-| `wps-lingxi/doubao_seed_2_1_pro_260628`| Doubao-Seed-2.1 Pro | 256K (262,144) | ~0.50x | ✅ 支持 |
-| `wps-lingxi/mimo-v2.6-pro` | Xiaomi MiMo-V2.6 Pro | 1M (1,048,576) | 0.10x | ❌ |
-| `wps-lingxi/plan_pro` | Pro 模式 (深度推理模式) | 1M (1,048,576) | 模式自适应 | ✅ 支持 |
-| `wps-lingxi/plan_max` | Max 模式 (复杂任务模式) | 1M (1,048,576) | 模式自适应 | ✅ 支持 |
-| `wps-lingxi/auto` | 自动智能调度模式 | 1M (1,048,576) | 1.0x | ✅ 支持 |
+### 原生通路（有真实 usage / reasoning / 原生 tool_calls）
+
+| 模型标识 | 名称 | 备注 |
+| :--- | :--- | :--- |
+| `wps-lingxi/deepseek-v4-pro` | DeepSeek V4 Pro | 旗舰推理 |
+| `wps-lingxi/GLM-5-Turbo` | GLM-5-Turbo | 智谱推理 |
+| `wps-lingxi/GLM-5.1` | GLM-5.1 | 智谱推理 |
+| `wps-lingxi/kimi-k2.6` | Kimi-K2.6 | 多 Agent / 长程编程 |
+| `wps-lingxi/<不透明 key>` ×2 | DeepSeek V4 Flash / V4 Flash 正式版 | key 是一段不透明串，以实时目录为准 |
+
+### 网页通路（能跑，但只有网页聊天级别的能力）
+
+| 模型标识 | 名称 |
+| :--- | :--- |
+| `wps-lingxi/kimi-k3.1-pro` | Kimi-K3.1 Pro |
+| `wps-lingxi/kimi-k3` | Kimi-K3 |
+| `wps-lingxi/deepseek-v4.1-flash` | DeepSeek V4.1 Flash |
+| `wps-lingxi/deepseek-v4-pro-0813` | DeepSeek V4 Pro |
+| `wps-lingxi/GLM-5.3` / `GLM-5.3-Flash` | GLM-5.3 系列 |
+| `wps-lingxi/qwen3.8_max` / `qwen3.8_flash` | Qwen3.8 系列 |
+| `wps-lingxi/minimax_m3` | MiniMax-M3 |
+| `wps-lingxi/doubao_seed_2_1_pro_260628` | Doubao-Seed-2.1 Pro |
+| `wps-lingxi/mimo-v2.6-pro` | Xiaomi MiMo-V2.6 Pro |
+| `wps-lingxi/plan_pro` / `plan_max` | Pro 模式 / Max 模式 |
+
+> 网页通路上的模型**不提供** token 用量，也**不会**因为 `reasoning_effort` 而输出思考过程。列表里的 `· 原生` / `· 网页` 后缀是判断依据。
 
 ---
 
 ## 🛠 独立测试
 
 项目内置了脱离 Magpie 运行的免安装自测脚本：
+
 ```bash
+# 全部回归用例（74 条）
+npm test
+
+# 只连真实上游跑一遍冒烟
 node test_lingxi.mjs "你的wps_sid"
 ```
+
+| 用例文件 | 覆盖范围 |
+| :--- | :--- |
+| `review.test.mjs` | SSE 解析、错误传播、并发隔离、配额窗口 |
+| `tools.test.mjs` | 工具调用信封桥接、历史压平 |
+| `prompt.test.mjs` | `SYSTEM → TOOLS → 历史 → User` 分段与去重 |
+| `native.test.mjs` | 网页通路请求体形状 |
+| `native-mode.test.mjs` | 原生 Agent Runtime 的 run → chat、`tool_calls` / `usage` 翻译 |
+| `routing.test.mjs` | 目录并集、`plan_*` 路由、懒预热、`X-Lingxi-Route` |
 
 ---
 
