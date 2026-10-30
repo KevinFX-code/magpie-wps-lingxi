@@ -319,6 +319,8 @@ function extractSid(raw) {
  */
 let appServerFetchPromise = null
 async function ensureAppServer() {
+  // app-server 只提供 Windows 平台产物，其他平台直接跳过（不去白下载 90MB）
+  if (process.platform !== "win32") return false
   if (appServerAvailable()) return true
   if (appServerFetchPromise) {
     try {
