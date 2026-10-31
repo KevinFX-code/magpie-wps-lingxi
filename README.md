@@ -160,6 +160,12 @@ magpie plugin add /path/to/magpie-wps-lingxi
 
 > 安装前先关掉上游同名插件：两者声明同一个 provider id `wps-lingxi`，同时启用会互相覆盖。
 
+> **关于 npm**：0.3.0 / 0.3.1 / 0.3.2 三次 `npm publish` 都只写进了元数据，tarball 一直 404
+> （`registry.npmjs.org` 上其他包正常、npm 状态页也全绿，怀疑是自动安全扫描扣住了这个包 ——
+> 它确实会读浏览器 Cookie 库、还会下载并执行远端二进制）。
+> 所以 **`npm` 上的 `latest` 已回退到能装的 `0.2.3`**（旧架构，网页端），
+> 0.3.x 请用上面的 `github:` 方式安装。等 npm 那边放行后再把 `latest` 推上去。
+
 ---
 
 ## 🚀 登录与使用
