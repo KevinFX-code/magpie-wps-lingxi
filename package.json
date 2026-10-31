@@ -1,6 +1,6 @@
 {
   "name": "@kevinfx/magpie-wps-lingxi",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Magpie provider plugin for WPS Lingxi (WPS 灵犀 / Lingxi Claw): native Agent Runtime with structured tool calls, daily check-in, usage balance query, and OpenAI-compatible reverse proxy",
   "type": "module",
   "main": "./index.mjs",
