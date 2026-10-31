@@ -697,17 +697,39 @@ function getTodayString() {
   return `${year}-${month}-${day}`
 }
 
+// 登录凭据解析：用户粘贴的可能是裸 wps_sid、`wps_sid=…`、整段
+// `Cookie: wps_sid=…; uid=…`，或 DevTools 里复制的一整行。统一归一成
+// `wps_sid=…; uid=…`，并按 uid（没有就按 sid 尾部）区分账号 —— 固定
+// accountId 会让第二个账号覆盖第一个。
+export function parseCookieInput(raw) {
+  let text = String(raw ?? "").trim()
+  if (!text) return null
+  text = text.replace(/^cookie:\s*/i, "").replace(/^["']|["']$/g, "").trim()
+
+  const pairs = new Map()
+  for (const part of text.split(";")) {
+    const eq = part.indexOf("=")
+    if (eq <= 0) continue
+    const name = part.slice(0, eq).trim()
+    const value = part.slice(eq + 1).trim()
+    if (name) pairs.set(name, value)
+  }
+
+  let sid = pairs.get("wps_sid") || ""
+  // 裸值（没有 `=`）就是 wps_sid 本身
+  if (!sid && !text.includes("=")) sid = text
+  if (!sid) return null
+
+  const uid = pairs.get("uid") || ""
+  const cookie = `wps_sid=${sid}${uid ? `; uid=${uid}` : ""}`
+  const accountId = uid ? `wps-${uid}` : `wps-${sid.slice(-8)}`
+  return { sid, uid, cookie, accountId }
+}
+
 function resolveCookie(auth) {
   if (!auth) return ""
-  if (auth.cookie) return auth.cookie
-  if (auth.metadata?.cookie) return auth.metadata.cookie
-  if (auth.key) {
-    return auth.key.startsWith("wps_sid=") ? auth.key : `wps_sid=${auth.key}`
-  }
-  if (auth.access) {
-    return auth.access.startsWith("wps_sid=") ? auth.access : `wps_sid=${auth.access}`
-  }
-  return ""
+  const cred = parseCookieInput(auth.cookie || auth.metadata?.cookie || auth.key || auth.access || "")
+  return cred ? cred.cookie : ""
 }
 
 // 动态拉取网页端可用模型
@@ -1444,7 +1466,21 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             const server = createServer((req, res) => {
               const url = new URL(req.url, `http://${req.headers.host}`)
               if (url.pathname === "/callback") {
-                const sid = url.searchParams.get("sid")?.trim() || ""
+                const cred = parseCookieInput(url.searchParams.get("sid")?.trim() || "")
+                if (!cred) {
+                  res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" })
+                  res.end(`
+                  <!DOCTYPE html>
+                  <html>
+                  <head><meta charset="utf-8"><title>凭据无效</title></head>
+                  <body style="font-family: -apple-system, sans-serif; text-align: center; padding-top: 60px;">
+                    <h2 style="color: #c42b1c">凭据无效</h2>
+                    <p style="font-size: 16px; color: #555">没有找到 wps_sid，请复制 Cookie 里的 wps_sid 值后重试。</p>
+                  </body>
+                  </html>
+                `)
+                  return
+                }
                 res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
                 res.end(`
                   <!DOCTYPE html>
@@ -1459,11 +1495,13 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 setTimeout(() => server.close(), 1500)
                 settle({
                   type: "success",
-                  access: sid,
+                  access: cred.sid,
                   refresh: "",
-                  expires: Date.now() + 30 * 24 * 3600 * 1000,
-                  cookie: sid.startsWith("wps_sid=") ? sid : `wps_sid=${sid}`,
-                  accountId: "WPS 灵犀账户",
+                  // 没有刷新接口；Cookie 实测约一年有效，旧的 30 天会在仍可用时被当成过期。
+                  expires: Date.now() + 360 * 24 * 3600 * 1000,
+                  cookie: cred.cookie,
+                  accountId: cred.accountId,
+                  metadata: { sid: cred.sid, uid: cred.uid, accountId: cred.accountId },
                 })
               } else {
                 res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
@@ -1515,14 +1553,16 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             },
           ],
           async authorize(inputs) {
-            const sid = String(inputs?.sid ?? "").trim()
-            if (!sid) return { type: "failed", error: "请输入有效的 wps_sid" }
+            const cred = parseCookieInput(inputs?.sid)
+            if (!cred) return { type: "failed", error: "请输入有效的 wps_sid（或整段 Cookie）" }
             return {
               type: "success",
-              key: sid,
+              key: cred.sid,
               metadata: {
-                cookie: sid.startsWith("wps_sid=") ? sid : `wps_sid=${sid}`,
-                accountId: "WPS 灵犀账户",
+                cookie: cred.cookie,
+                accountId: cred.accountId,
+                sid: cred.sid,
+                uid: cred.uid,
               },
             }
           },
