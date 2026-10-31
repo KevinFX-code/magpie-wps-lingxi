@@ -101,6 +101,29 @@
 
 ---
 
+## 🧩 工具信封的方言（0.2.3）
+
+网页通路只能靠「模型在正文里输出一个标记块」来调工具，而不同模型的 chat template 习惯不一样。0.2.3 起两种方言都认：
+
+| 方言 | 长什么样 | 谁在用 |
+|---|---|---|
+| **JSON**（文档写法） | `<\|FunctionCallBegin\|>[{"name":"write","parameters":{…}}]<\|FunctionCallEnd\|>` | DeepSeek 系，以及提示词引导成功时 |
+| **XML**（模型自带） | `<\|FunctionCallBegin\|><function name="write"><parameter name="file_path" string="true">a.txt</parameter></function></seed:tool_call>` | Kimi / Qwen 系 |
+
+XML 方言的解析规则：
+
+- `string="true"` → 值按**原文字符串**处理（适合放 SVG / 代码这类内容）
+- `string="false"` → 值本身是 JSON，解析成对象（如 `files` 数组）
+- 结束标记除 `<|FunctionCallEnd|>` 外，也接受 `</seed:tool_call>`、`<|tool_call_end|>`
+- **工具名必须在本轮请求的清单里**，否则不执行、原样留在正文（防止模型只是"讨论"这个格式时被误触发）
+
+> 为什么需要这个：实测 `kimi-k3.1-pro` 走网页通路时，会先用 `<|FunctionCallBegin|>` 开头，然后吐自己训练里的 XML 写法、再用 `</seed:tool_call>` 收尾。0.2.2 只认 JSON，于是整块 12KB（含整份 SVG 源码）被当成正文打印出来，文件根本没写。0.2.3 认了这套方言后，同一条消息解析出 `write` + `present` 两个真实调用，正文只剩 472 字。
+>
+> 提示词里同时也显式禁掉了 XML 写法，双保险。
+
+
+---
+
 ## 📦 安装方式
 
 ### 方式 1：通过 Magpie CLI 一键安装（推荐）

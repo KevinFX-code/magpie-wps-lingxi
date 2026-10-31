@@ -18,4 +18,5 @@ jobs:
       - run: node --test native-mode.test.mjs
       - run: node --test routing.test.mjs
       - run: node --test budget.test.mjs
+      - run: node --test envelope.test.mjs
 

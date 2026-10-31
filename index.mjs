@@ -19,6 +19,10 @@ const NPM = "@ai-sdk/openai-compatible"
 // 并把这一轮当成「没有工具调用 → 正常结束」。
 const TOOL_CALL_BEGIN = "<|FunctionCallBegin|>"
 const TOOL_CALL_END = "<|FunctionCallEnd|>"
+// Kimi 系列有时会用自己训练里的结束标记收尾（实测 kimi-k3.1-pro 走网页通路时如此），
+// 内容还是同一个工具块，只是收尾换了个 token。不认它整块就会漏成正文。
+const TOOL_CALL_END_ALTS = ["</seed:tool_call>", "<|tool_call_end|>"]
+const TOOL_CALL_ENDS = [TOOL_CALL_END, ...TOOL_CALL_END_ALTS]
 const TOOL_CALL_MAX_BUFFER = 1 << 20
 const TOOL_BRIDGE_ENABLED = process.env.MAGPIE_LINGXI_TOOL_BRIDGE !== "0"
 
@@ -73,6 +77,10 @@ function toolProtocolPrompt(tools) {
     `${TOOL_CALL_BEGIN}[{"name":"<工具名>","parameters":{...}}]${TOOL_CALL_END}`,
     "规则：工具名与参数名必须与下面的 schema 完全一致；parameters 必须是 JSON 对象；",
     "一次可以调用多个工具（数组里放多个对象）；标记块之后不要再输出解释，等待工具结果。",
+    // Kimi / Qwen 的 chat template 习惯吐 XML 工具方言，这里必须显式否掉，
+    // 否则它们会写 <function name=...><parameter ...> 并用 </seed:tool_call> 收尾。
+    `禁止使用 <function name="..."><parameter name="..."> 这种 XML 写法，也禁止用 </seed:tool_call> 之类的标记收尾；`,
+    `结束标记只能是 ${TOOL_CALL_END}，标记块里面只能是 JSON 数组，不能是 XML。`,
     "可用工具：",
     JSON.stringify(tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }))),
   ].join("\n")
@@ -98,6 +106,12 @@ function nativeCallBlock(toolCalls) {
 
 // 只接受「结构合法 + 工具名在本次请求清单内」的载荷，避免模型讨论这个格式时被误触发
 function parseNativeToolCalls(payload, allowed) {
+  const json = parseJsonToolCalls(payload, allowed)
+  if (json) return json
+  return parseXmlToolCalls(payload, allowed)
+}
+
+function parseJsonToolCalls(payload, allowed) {
   let parsed
   try { parsed = JSON.parse(payload) } catch { return null }
   const list = Array.isArray(parsed) ? parsed : [parsed]
@@ -120,6 +134,42 @@ function parseNativeToolCalls(payload, allowed) {
     calls.push({ name, arguments: args })
   }
   return calls
+}
+
+/**
+ * 模型自带的 XML 工具方言（Kimi / Qwen 的 chat template 都是这一套）：
+ *   <function name="write">
+ *   <parameter name="file_path" string="true">a.txt</parameter>
+ *   <parameter name="files" string="false">[{"path":"..."}]</parameter>
+ *   </function>
+ * string="false" 表示值本身是 JSON，其余按原文字符串处理。
+ * 实测 kimi-k3.1-pro 在网页通路上会混用这套写法，只认 JSON 就会整块漏成正文。
+ */
+function parseXmlToolCalls(payload, allowed) {
+  if (!allowed.size || !/<function\s+name\s*=/.test(payload)) return null
+  const calls = []
+  const fnRe = /<function\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/function>/g
+  let fn
+  while ((fn = fnRe.exec(payload))) {
+    const name = fn[1].trim()
+    if (!name || !allowed.has(name)) return null
+    const params = {}
+    const paramRe = /<parameter\s+name\s*=\s*"([^"]*)"(?:\s+string\s*=\s*"(true|false)")?\s*>([\s\S]*?)<\/parameter>/g
+    let p
+    while ((p = paramRe.exec(fn[2]))) {
+      const key = p[1].trim()
+      if (!key) continue
+      const isString = p[2] !== "false"
+      const raw = p[3]
+      if (isString) {
+        params[key] = raw
+      } else {
+        try { params[key] = JSON.parse(raw) } catch { params[key] = raw }
+      }
+    }
+    calls.push({ name, arguments: JSON.stringify(params) })
+  }
+  return calls.length ? calls : null
 }
 
 // 最长「可能是标记前缀」的后缀长度，流式时先扣住不吐，避免标记被切断后漏到正文
@@ -154,14 +204,17 @@ function createToolCallParser(allowedNames) {
         }
         return
       }
-      const at = buffer.indexOf(TOOL_CALL_END)
-      if (at >= 0) {
-        const payload = buffer.slice(0, at)
-        buffer = buffer.slice(at + TOOL_CALL_END.length)
+      const hit = TOOL_CALL_ENDS
+        .map((marker) => ({ marker, at: buffer.indexOf(marker) }))
+        .filter((x) => x.at >= 0)
+        .sort((a, b) => a.at - b.at)[0]
+      if (hit) {
+        const payload = buffer.slice(0, hit.at)
+        buffer = buffer.slice(hit.at + hit.marker.length)
         inCall = false
         const calls = parseNativeToolCalls(payload, allowed)
         if (calls) out.push({ type: "calls", calls })
-        else if (payload) out.push({ type: "text", value: TOOL_CALL_BEGIN + payload + TOOL_CALL_END })
+        else if (payload) out.push({ type: "text", value: TOOL_CALL_BEGIN + payload + hit.marker })
         continue
       }
       if (buffer.length > TOOL_CALL_MAX_BUFFER) {
