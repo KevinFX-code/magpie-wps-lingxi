@@ -2,6 +2,8 @@ name: Provider regression tests
 on:
   push:
   pull_request:
+  schedule:
+    - cron: '0 2 * * *' # 每天一次，专门抓上游悄悄改行为
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -11,12 +13,18 @@ jobs:
         with:
           node-version: '22'
       - run: node --check index.mjs
-      - run: node --test review.test.mjs
-      - run: node --test tools.test.mjs
-      - run: node --test prompt.test.mjs
-      - run: node --test native.test.mjs
-      - run: node --test native-mode.test.mjs
-      - run: node --test routing.test.mjs
-      - run: node --test budget.test.mjs
-      - run: node --test envelope.test.mjs
-
+      - run: node --test
+  live:
+    runs-on: ubuntu-latest
+    # 同仓库的 PR 和 main 上的 push 才跑；fork 的 PR 拿不到 secret，跑了也只会跳过。
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Live upstream check (skips when the secret is absent)
+        run: node --test tests/live.test.mjs
+        timeout-minutes: 8
+        env:
+          WPS_LINGXI_COOKIE: ${{ secrets.WPS_LINGXI_COOKIE }}

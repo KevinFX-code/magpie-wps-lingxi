@@ -1,0 +1,9 @@
+{
+  "package": "@kevinfx/magpie-wps-lingxi",
+  "name": "WPS 灵犀",
+  "providers": ["wps-lingxi"],
+  "summary": {
+    "en": "Signs in to WPS Lingxi with a pasted cookie and exposes its desktop-client agent runtime as OpenAI-compatible models, plus daily check-in and credit balance.",
+    "zh": "用粘贴的 Cookie 登录 WPS 灵犀，把桌面客户端同一条 agent-runtime 通路接成 OpenAI 兼容模型，并提供每日签到与智点余额查询。"
+  }
+}

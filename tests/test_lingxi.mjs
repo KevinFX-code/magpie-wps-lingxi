@@ -2,7 +2,7 @@
 // WPS 灵犀独立测试与验证工具
 // 支持：测试登录凭证有效性、查询灵犀额度、执行每日签到、测试模型对话
 
-import { WPSLingxiAuthPlugin } from "./index.mjs"
+import { WPSLingxiAuthPlugin } from "../index.mjs"
 
 const sid = process.env.WPS_SID || process.argv[2]
 
