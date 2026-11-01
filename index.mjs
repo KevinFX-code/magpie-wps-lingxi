@@ -871,6 +871,17 @@ function looksLikeStaleRun(message) {
     (text.includes("session") && text.includes("not found"))
 }
 
+// 仅匹配已报告的错误标识/拒答文案；普通“审核”可能是服务故障，不足以判定内容拦截。
+function isAuditError(error) {
+  return /\bAuditFailed\b|\baudit_blocked\b|暂时无法回答此问题/i.test(
+    [error?.code, error?.result, error?.message, textOfPayload(error), error?.error?.code].join(" ")
+  )
+}
+
+function chatErrorCode(error) {
+  return isAuditError(error) ? "audit_blocked" : "upstream_error"
+}
+
 async function postJson(url, cookie, base, body, signal, extra = {}) {
   const response = await fetch(url, {
     method: "POST",
@@ -880,18 +891,20 @@ async function postJson(url, cookie, base, body, signal, extra = {}) {
   })
   const text = await response.text().catch(() => "")
   let payload = {}
-  try { payload = text ? JSON.parse(text) : {} } catch { payload = {} }
+  try { payload = text ? JSON.parse(text) : {} } catch { payload = { message: text } }
   if (!response.ok) {
     const detail = envelopeError(payload) || textOfPayload(payload) || text.slice(0, 200)
-    const hint = response.status === 401 || response.status === 403 ? "（WPS 登录态可能已失效，请重新粘贴 Cookie）" : ""
+    const hint = !isAuditError(payload) && (response.status === 401 || response.status === 403) ? "（WPS 登录态可能已失效，请重新粘贴 Cookie）" : ""
     const error = new Error(`WPS 灵犀上游返回 ${response.status}${hint}${detail ? `：${detail}` : ""}`)
     error.status = response.status
+    if (isAuditError(payload)) error.code = "audit_blocked"
     throw error
   }
-  const envelope = envelopeError(payload)
+  const envelope = envelopeError(payload) || (isAuditError(payload) ? textOfPayload(payload) || "AuditFailed" : "")
   if (envelope) {
     const error = new Error(`WPS 灵犀上游返回错误：${envelope}`)
     error.status = response.status
+    if (isAuditError(payload)) error.code = "audit_blocked"
     throw error
   }
   return payload
@@ -949,6 +962,7 @@ async function ensureRun(cookie, key, model, title, signal, extra = {}, runExtra
       runs.set(key, run)
       return run
     } catch (error) {
+      if (isAuditError(error)) throw error
       lastError = error
     }
   }
@@ -1161,6 +1175,12 @@ class LingxiTranslator {
     this.consumeFrame(frame, out)
   }
   consumeFrame(frame, out) {
+    if (isAuditError(frame)) {
+      this.finished = true
+      const error = new Error(`灵犀上游返回 AuditFailed：${textOfPayload(frame) || "内容被审核拦截"}`)
+      error.code = "audit_blocked"
+      throw error
+    }
     const code = typeof frame?.code === "string" ? frame.code : ""
     if (code && code.toLowerCase() !== "success") {
       this.finished = true
@@ -1264,15 +1284,20 @@ async function requestAgent(cookie, run, payload, signal, clientType) {
     const text = await response.text().catch(() => "")
     const error = new Error(`WPS 灵犀上游返回 ${response.status}${text ? `：${text.slice(0, 200)}` : ""}`)
     error.status = response.status
+    // 在截断展示文案前检查完整错误体，避免丢失末尾的审核标识。
+    let payload
+    try { payload = JSON.parse(text) } catch { payload = { message: text } }
+    if (isAuditError(payload)) error.code = "audit_blocked"
     throw error
   }
   if (!response.body) throw new Error("WPS 灵犀上游没有返回响应体")
   return response
 }
 
-// magpie 用状态码区分「模型级错误」和「登录失效」：模型/参数问题必须是 404，
+// 审核拦截是请求级 400；其余沿用既有的模型/参数错误 404、登录失效 401 映射。
 // 只有明确的鉴权失败才给 401（否则会把账号标成未登录、从路由里摘掉）。
 function chatErrorStatus(error) {
+  if (isAuditError(error)) return 400
   const status = Number(error?.status) || 0
   const text = String(error?.message || "")
   if (status === 401 || status === 403) {
@@ -1298,7 +1323,7 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
   try {
     response = await requestAgent(cookie, run, payload, signal, clientType)
   } catch (error) {
-    if (!looksLikeStaleRun(error.message)) throw error
+    if (isAuditError(error) || !looksLikeStaleRun(error.message)) throw error
     runs.delete(key)
     run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
     response = await requestAgent(cookie, run, payload, signal, clientType)
@@ -1323,24 +1348,24 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
       return new Response(JSON.stringify(folded), { headers: { "Content-Type": "application/json" } })
     } catch (error) {
       signal?.throwIfAborted()
-      return errorResponse(error.message, 502)
+      return errorResponse(error.message, chatErrorStatus(error), chatErrorCode(error))
     }
   }
 
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let sawError = false
-  const fail = (controller, message) => {
+  const fail = (controller, error) => {
     if (sawError) return
     sawError = true
-    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, type: "upstream_error", code: "upstream_error" } })}\n\n`))
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: error.message, type: "upstream_error", code: chatErrorCode(error) } })}\n\n`))
   }
   const transform = new TransformStream({
     transform(chunk, controller) {
       try {
         for (const frame of translator.push(decoder.decode(chunk, { stream: true }))) controller.enqueue(encoder.encode(frame))
       } catch (error) {
-        fail(controller, error.message)
+        fail(controller, error)
       }
     },
     flush(controller) {
@@ -1348,7 +1373,7 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
         for (const frame of translator.push(decoder.decode())) controller.enqueue(encoder.encode(frame))
         if (!translator.finished) for (const frame of translator.finish()) controller.enqueue(encoder.encode(frame))
       } catch (error) {
-        fail(controller, error.message)
+        fail(controller, error)
       }
     },
   })
@@ -2302,7 +2327,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
             } catch (error) {
               signal?.throwIfAborted()
-              return errorResponse(error?.message || String(error), chatErrorStatus(error), "upstream_error")
+              return errorResponse(error?.message || String(error), chatErrorStatus(error), chatErrorCode(error))
             }
           },
         }
