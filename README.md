@@ -24,7 +24,7 @@
 一个 magpie / OpenCode 供应商插件：登录 WPS 灵犀，把它的模型接进 Magpie、DeepSeek Harness、
 Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 
-**桌面端对齐（灵犀 1.3.31）**：14 个默认模型、1 条对话通路、3 个请求步骤（建会话 → 领 run → chat/completions）。
+**桌面端对齐（灵犀 1.3.31）**：11 个默认模型、1 条对话通路、3 个请求步骤（建会话 → 领 run → chat/completions）。
 
 ---
 
@@ -51,7 +51,7 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
   带余额和到期日（判据与 jet 插件一致；`MAGPIE_LINGXI_TEMP_DAYS` 可改天数）。
   优先消耗由服务端决定，这里只负责让你看见“哪部分马上要过期”。
 - 🔄 **模型目录 (`provider.models`)**  
-  只读客户端自己的 `GET /api/aioffice/v1/sessions/plans`（`plans` + `models`，带倍率与推理档位）；
+  只读客户端自己的 `GET /api/aioffice/v1/sessions/plans`（只取 `data.models`，带倍率与推理档位）；
   未登录时用手指量的快照，不假装实时。
 - 🔑 **账号导入 + 多账号**  
   三条登录路：浏览器登录自己抓会话、导入本机灵犀客户端登录态（Windows，读客户端 Cookie 库）、
@@ -84,7 +84,7 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 | 对话端点 | ✅ | 只有 `agent-runtime/chat/completions`；网页通路已删 |
 | 会话 / run | ✅ | cowork 会话 + credits/runs，`session_type:"cowork_client"`、`agent_version:2` |
 | 请求头 | ✅ | `X-Client-Type`、`X-Client-Lang`、`X-Cc-Agent-Type`、`X-Cc-Session-ID`、`X-Cc-Run-ID`、`X-Request-Id`；有 `copilot_server_branch` 时带 `X-Cc-Region` |
-| 模型目录 | ✅ | 登录后取 `sessions/plans` 的 `plans`+`models`；未登录用快照 |
+| 模型目录 | ✅ | 登录后只取 `sessions/plans` 的 `data.models`；未登录用真实模型快照 |
 | 思考档位 | ✅ | 每个模型按目录里的 `reasoning_efforts` 生成 `variants`（对象），宿主选档后原样作为 `reasoning_effort` 发上游 |
 | 工具调用 | ✅ | 原生 `tools` / `tool_calls`，不再从正文反解 |
 | 流式帧 | ✅ | `choices[].text` / `reasoning_content` / `tool_calls` / `finish_reason`，`code != Success` 即报错 |
