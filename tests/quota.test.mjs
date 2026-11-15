@@ -45,7 +45,7 @@ test('usage: standard account gets a finite used and no temp window at 30 days',
       total_balance: 2393,
       total_contract: 0,
       bonus_summary: { total_value: 2400, total_consumed: 7, items: [] },
-      bonus_credits: [{ balance: 2393, value: 2400, consumed: 7, expire_time: '2026-11-30T07:06:59+08:00' }],
+      bonus_credits: [{ balance: 2393, value: 2400, consumed: 7, expire_time: new Date(Date.now() + 30 * DAY).toISOString() }],
     },
   })
   try {
