@@ -151,7 +151,7 @@ function toIso(value) {
 // 汇总「临时积分」：只算未过期、且在窗口内的赠送批次。
 // 纯函数，便于对边界（正好 15 天、已过期、坏时间）做单测。
 function summarizeExpiring(items, nowMs = Date.now(), windowMs = TEMP_CREDIT_WINDOW_MS) {
-  const out = { balance: 0, value: 0, consumed: 0, earliest: "" }
+  const groups = new Map()
   for (const item of Array.isArray(items) ? items : []) {
     const expireMs = Date.parse(item?.expire_time ?? "")
     if (!Number.isFinite(expireMs) || expireMs <= nowMs) continue
@@ -159,11 +159,22 @@ function summarizeExpiring(items, nowMs = Date.now(), windowMs = TEMP_CREDIT_WIN
     const balance = Number(item.balance ?? 0)
     const value = Number(item.value ?? 0)
     const consumed = Number(item.consumed ?? Math.max(0, value - balance))
-    if (![balance, value, consumed].every(Number.isFinite)) continue
-    out.balance += balance
-    out.value += value
-    out.consumed += consumed
-    if (!out.earliest || expireMs < Date.parse(out.earliest)) out.earliest = String(item.expire_time)
+    if (![balance, value, consumed].every(Number.isFinite) || balance <= 0 || value < 0 || consumed < 0) continue
+    let group = groups.get(expireMs)
+    if (!group) {
+      group = { balance: 0, value: 0, consumed: 0, earliest: String(item.expire_time), expireMs }
+      groups.set(expireMs, group)
+    }
+    group.balance += balance
+    group.value += value
+    group.consumed += consumed
+  }
+  const batches = [...groups.values()].sort((a, b) => a.expireMs - b.expireMs)
+  const out = { balance: 0, value: 0, consumed: 0, earliest: batches[0]?.earliest || "", batches }
+  for (const batch of batches) {
+    out.balance += batch.balance
+    out.value += batch.value
+    out.consumed += batch.consumed
   }
   return out
 }
@@ -2212,14 +2223,11 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
           }
 
           const nowMs = Date.now()
-          let earliestExpire = ""
           const bonusItems = data.bonus_credits || data.bonus_summary?.items || []
-          for (const item of bonusItems) {
-            if (!(item.balance > 0) || !item.expire_time) continue
-            const expireMs = Date.parse(item.expire_time)
-            if (!Number.isFinite(expireMs) || expireMs <= nowMs) continue
-            if (!earliestExpire || expireMs < Date.parse(earliestExpire)) earliestExpire = item.expire_time
-          }
+          // 路由只报告实际在最早到期时失效的批次金额，不把后续批次混进来。
+          const allExpiring = summarizeExpiring(bonusItems, nowMs, 0)
+          const earliestBatch = allExpiring.batches[0]
+          const earliestExpire = earliestBatch?.earliest || ""
 
           // 路由页和额度面板要的是“窗口”（总额/剩余/已用/重置时间），
           // 只给 balance 字符串会被当成“剩余额度未知”。
@@ -2228,19 +2236,16 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
           const usedPct = hasQuota ? Math.max(0, Math.min(100, (totalConsumed / totalValue) * 100)) : 0
 
           // 临时积分：15 天内到期的赠送批次（与 jet 插件同一判据）。
-          // 上游 bonus_credits 每个批次都带 balance / value / consumed / expire_time。
+          // 不同到期日分开显示；这些额度已包含在总智点里，只作展示避免重复路由。
           const expiring = summarizeExpiring(bonusItems, nowMs)
 
           const windows = []
-          if (expiring.balance > 0) {
+          for (const batch of expiring.batches) {
             windows.push({
               name: "临时积分",
-              used: expiring.value > 0 ? Math.max(0, Math.min(100, (expiring.consumed / expiring.value) * 100)) : 0,
-              remaining: expiring.balance,
-              ...(expiring.value > 0 ? { amount: expiring.consumed, limit: expiring.value } : {}),
-              display: `${expiring.balance.toLocaleString()} 智点 · ${creditDateLabel(expiring.earliest)} 到期`,
+              display: `${batch.balance.toLocaleString()} 智点 · ${creditDateLabel(batch.earliest)} 到期`,
               unit: "智点",
-              resetsAt: expiring.earliest,
+              aside: true,
             })
           }
           windows.push({
@@ -2252,7 +2257,10 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               ? `${totalBalance.toLocaleString()} / ${totalValue.toLocaleString()} 智点`
               : `${totalBalance.toLocaleString()} 智点`,
             unit: "智点",
-            // 到期时间不是“补充时间”，这里不放进 resetsAt，只作为 until 展示。
+            // 顶层 until 仅用于展示；路由读取窗口的 runsOutAt/runsOut。
+            ...(earliestBatch && totalBalance > 0
+              ? { runsOutAt: toIso(earliestBatch.earliest), runsOut: Math.min(earliestBatch.balance, totalBalance) }
+              : {}),
           })
 
           return {
