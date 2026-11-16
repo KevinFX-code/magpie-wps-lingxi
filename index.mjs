@@ -878,6 +878,13 @@ function lastUserText(body) {
 
 const runs = new Map()
 
+// PermissionDenied invalidates the session/run pair, even though the error is not retryable.
+function invalidateRun(run) {
+  for (const [key, cached] of runs) {
+    if (cached === run) runs.delete(key)
+  }
+}
+
 function looksLikeStaleRun(message) {
   const text = String(message ?? "").toLowerCase()
   return text.includes("sqlnorows") || text.includes("no rows") ||
@@ -892,8 +899,20 @@ function isAuditError(error) {
   )
 }
 
+function upstreamErrorCode(payload) {
+  const code = payload?.code ?? payload?.error?.code
+  return typeof code === "string" ? code.trim() : ""
+}
+
+function isPermissionDenied(error) {
+  return Number(error?.status) === 403 &&
+    String(error?.upstreamCode || "").toLowerCase() === "permissiondenied"
+}
+
 function chatErrorCode(error) {
-  return isAuditError(error) ? "audit_blocked" : "upstream_error"
+  if (isAuditError(error)) return "audit_blocked"
+  if (isPermissionDenied(error)) return error.upstreamCode
+  return "upstream_error"
 }
 
 async function postJson(url, cookie, base, body, signal, extra = {}) {
@@ -1301,17 +1320,22 @@ async function requestAgent(cookie, run, payload, signal, clientType) {
     // 在截断展示文案前检查完整错误体，避免丢失末尾的审核标识。
     let payload
     try { payload = JSON.parse(text) } catch { payload = { message: text } }
+    const upstreamCode = upstreamErrorCode(payload)
+    if (upstreamCode) error.upstreamCode = upstreamCode
     if (isAuditError(payload)) error.code = "audit_blocked"
+    if (isPermissionDenied(error)) invalidateRun(run)
     throw error
   }
   if (!response.body) throw new Error("WPS 灵犀上游没有返回响应体")
   return response
 }
 
-// 审核拦截是请求级 400；其余沿用既有的模型/参数错误 404、登录失效 401 映射。
+// 审核拦截是请求级 400；明确的 PermissionDenied 保留 403。
+// 其余沿用既有的模型/参数错误 404、登录失效 401 映射。
 // 只有明确的鉴权失败才给 401（否则会把账号标成未登录、从路由里摘掉）。
 function chatErrorStatus(error) {
   if (isAuditError(error)) return 400
+  if (isPermissionDenied(error)) return 403
   const status = Number(error?.status) || 0
   const text = String(error?.message || "")
   if (status === 401 || status === 403) {

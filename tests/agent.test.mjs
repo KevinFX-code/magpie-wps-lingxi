@@ -194,6 +194,76 @@ test('a stale run is rebuilt once and retried', async () => {
   }
 })
 
+for (const stream of [false, true]) {
+  test(`HTTP 403 PermissionDenied is preserved and invalidates the cached run (stream=${stream})`, async () => {
+    const plugin = await WPSLingxiAuthPlugin()
+    let authReads = 0
+    const loader = await plugin.auth.loader(async () => {
+      authReads += 1
+      return { cookie: COOKIE }
+    })
+    const model = `permission-denied-regression-${stream ? 'stream' : 'json'}`
+    let sessions = 0
+    let runs = 0
+    let chats = 0
+    const net = installFetch((call) => {
+      if (call.url.endsWith('/api/aioffice/v1/cowork/sessions')) {
+        sessions += 1
+        return Response.json({ code: 'Success', data: { session_id: `permission-s${sessions}` } })
+      }
+      if (call.url.endsWith('/api/public/v1/credits/runs')) {
+        runs += 1
+        return Response.json({ code: 'Success', data: { run_id: `permission-r${runs}` } })
+      }
+      if (call.url.includes('/agent-runtime/chat/completions')) {
+        chats += 1
+        if (chats === 1) {
+          return Response.json({ code: 'PermissionDenied', message: '无权限' }, { status: 403 })
+        }
+        return sse([{ code: 'Success', choices: [{ index: 0, text: 'recovered', finish_reason: 'stop' }] }])
+      }
+      return new Response('not found', { status: 404 })
+    })
+    const request = () => loader.fetch('https://mock', {
+      body: JSON.stringify({
+        model,
+        stream,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    try {
+      const denied = await request()
+      const deniedBody = await denied.json()
+      assert.equal(denied.status, 403)
+      assert.equal(deniedBody.error.code, 'PermissionDenied')
+      assert.match(deniedBody.error.message, /PermissionDenied/)
+      assert.match(deniedBody.error.message, /无权限/)
+      assert.equal(sessions, 1)
+      assert.equal(runs, 1)
+      assert.equal(chats, 1, 'permission failure must not retry the same request')
+      assert.equal(authReads, 1, 'permission failure must not request another credential')
+      assert.equal(net.calls.some((call) => call.url.includes('lingxi.kdocs.cn')), false)
+
+      const recovered = await request()
+      assert.equal(recovered.status, 200)
+      if (stream) {
+        assert.match(await recovered.text(), /recovered/)
+      } else {
+        assert.equal((await recovered.json()).choices[0].message.content, 'recovered')
+      }
+      assert.equal(sessions, 2, 'the next request must create a fresh session')
+      assert.equal(runs, 2, 'the next request must create a fresh run')
+      assert.equal(chats, 2)
+      assert.equal(authReads, 2)
+      const chatCalls = net.calls.filter((call) => call.url.includes('/agent-runtime/chat/completions'))
+      assert.deepEqual(chatCalls.map((call) => call.headers['x-cc-run-id']), ['permission-r1', 'permission-r2'])
+    } finally {
+      net.restore()
+    }
+  })
+}
+
 test('checkin claims the daily reward and only claimable one-time tasks', async () => {
   const plugin = await WPSLingxiAuthPlugin()
   let balance = 1000
