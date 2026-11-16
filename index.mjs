@@ -909,9 +909,15 @@ function isPermissionDenied(error) {
     String(error?.upstreamCode || "").toLowerCase() === "permissiondenied"
 }
 
+function isInvalidArgument(error) {
+  return Number(error?.status) === 400 &&
+    String(error?.upstreamCode || "").toLowerCase() === "invalidargument"
+}
+
 function chatErrorCode(error) {
   if (isAuditError(error)) return "audit_blocked"
   if (isPermissionDenied(error)) return error.upstreamCode
+  if (isInvalidArgument(error)) return error.upstreamCode
   return "upstream_error"
 }
 
@@ -1330,12 +1336,13 @@ async function requestAgent(cookie, run, payload, signal, clientType) {
   return response
 }
 
-// 审核拦截是请求级 400；明确的 PermissionDenied 保留 403。
+// 审核拦截和明确的 InvalidArgument 保留请求级 400；PermissionDenied 保留 403。
 // 其余沿用既有的模型/参数错误 404、登录失效 401 映射。
 // 只有明确的鉴权失败才给 401（否则会把账号标成未登录、从路由里摘掉）。
 function chatErrorStatus(error) {
   if (isAuditError(error)) return 400
   if (isPermissionDenied(error)) return 403
+  if (isInvalidArgument(error)) return 400
   const status = Number(error?.status) || 0
   const text = String(error?.message || "")
   if (status === 401 || status === 403) {

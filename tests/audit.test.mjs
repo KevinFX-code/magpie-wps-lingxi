@@ -126,6 +126,28 @@ for (const [status, message, expected] of [
   })
 }
 
+for (const payload of [
+  { code: 'InvalidArgument', message: '参数错误' },
+  { error: { code: 'InvalidArgument', message: '参数错误' } },
+]) {
+  for (const stream of [false, true]) {
+    test(`HTTP 400 InvalidArgument is preserved, stream=${stream}: no replay`, async () => {
+      await exercise({
+        stream,
+        reply: () => Response.json(payload, { status: 400 }),
+        verify({ response, text, calls, authReads }) {
+          assert.equal(response.status, 400)
+          const { error } = JSON.parse(text)
+          assert.equal(error.code, 'InvalidArgument')
+          assert.match(error.message, /参数错误/)
+          assert.equal(calls.filter(c => c.path === chatPath).length, 1)
+          assert.equal(authReads, 1, 'invalid arguments must not rotate credentials')
+        },
+      })
+    })
+  }
+}
+
 for (const stream of [false, true]) {
   for (const partial of [false, true]) {
     test(`HTTP 200 SSE AuditFailed, stream=${stream}, partial=${partial}: no replay or false completion`, async () => {
