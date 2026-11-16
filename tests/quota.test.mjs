@@ -24,6 +24,25 @@ test('expiring: only unexpired batches inside the window count', () => {
   assert.equal(s.value, 400)
   assert.equal(s.consumed, 100)
   assert.equal(Date.parse(s.earliest), now + 5 * DAY)
+  assert.deepEqual(s.batches.map(({ balance, value, consumed }) => ({ balance, value, consumed })), [
+    { balance: 100, value: 100, consumed: 0 },
+    { balance: 200, value: 300, consumed: 100 },
+  ])
+})
+
+test('expiring: batches with the same expiry are grouped, distinct expiries stay separate', () => {
+  const first = new Date(now + DAY).toISOString()
+  const second = new Date(now + 2 * DAY).toISOString()
+  const s = _internal.summarizeExpiring([
+    { balance: 40, value: 50, consumed: 10, expire_time: first },
+    { balance: 60, value: 60, consumed: 0, expire_time: first },
+    { balance: 90, value: 100, consumed: 10, expire_time: second },
+  ], now, 15 * DAY)
+  assert.equal(s.batches.length, 2)
+  assert.deepEqual(s.batches.map(({ balance, value, consumed }) => ({ balance, value, consumed })), [
+    { balance: 100, value: 110, consumed: 10 },
+    { balance: 90, value: 100, consumed: 10 },
+  ])
 })
 
 test('expiring: exactly at the window edge counts, one ms over does not', () => {
@@ -40,12 +59,13 @@ test('expiring: consumed falls back to value - balance', () => {
 
 test('usage: standard account gets a finite used and no temp window at 30 days', async () => {
   const plugin = await WPSLingxiAuthPlugin()
+  const expireTime = new Date(Date.now() + 30 * DAY).toISOString()
   const restore = installFetch({
     data: {
       total_balance: 2393,
       total_contract: 0,
       bonus_summary: { total_value: 2400, total_consumed: 7, items: [] },
-      bonus_credits: [{ balance: 2393, value: 2400, consumed: 7, expire_time: new Date(Date.now() + 30 * DAY).toISOString() }],
+      bonus_credits: [{ balance: 2393, value: 2400, consumed: 7, expire_time: expireTime }],
     },
   })
   try {
@@ -55,6 +75,47 @@ test('usage: standard account gets a finite used and no temp window at 30 days',
     assert.ok(Number.isFinite(u.windows[0].used))
     assert.equal(u.windows[0].amount, 7)
     assert.equal(u.windows[0].limit, 2400)
+    assert.equal(u.windows[0].runsOutAt, expireTime)
+    assert.equal(u.windows[0].runsOut, 2393)
+  } finally { restore() }
+})
+
+test('usage: earliest expiry carries only its batch amount and temp windows do not double-count', async () => {
+  const plugin = await WPSLingxiAuthPlugin()
+  const firstExpiry = new Date(Date.now() + DAY).toISOString()
+  const laterExpiry = new Date(Date.now() + 10 * DAY).toISOString()
+  const restore = installFetch({
+    data: {
+      total_balance: 1000,
+      total_contract: 0,
+      bonus_summary: { total_value: 1200, total_consumed: 200, items: [] },
+      bonus_credits: [
+        { balance: 100, value: 100, consumed: 0, expire_time: firstExpiry },
+        { balance: 900, value: 1100, consumed: 200, expire_time: laterExpiry },
+      ],
+    },
+  })
+  try {
+    const u = await plugin.auth.usage(async () => ({ cookie: 'wps_sid=x' }))
+    assert.equal(u.windows.length, 3)
+    const [first, later, total] = u.windows
+    assert.equal(first.name, '临时积分')
+    assert.match(first.display, /100 智点/)
+    assert.ok(first.display.includes(`${firstExpiry.slice(5, 7)}-${firstExpiry.slice(8, 10)} 到期`))
+    assert.equal(first.aside, true)
+    assert.match(later.display, /900 智点/)
+    assert.ok(later.display.includes(`${laterExpiry.slice(5, 7)}-${laterExpiry.slice(8, 10)} 到期`))
+    assert.equal(later.aside, true)
+    for (const batch of [first, later]) {
+      assert.equal(batch.amount, undefined)
+      assert.equal(batch.limit, undefined)
+      assert.equal(batch.runsOutAt, undefined)
+      assert.equal(batch.runsOut, undefined)
+    }
+    assert.equal(total.name, '智点')
+    assert.equal(total.runsOutAt, firstExpiry)
+    assert.equal(total.runsOut, 100)
+    assert.equal(u.until, firstExpiry)
   } finally { restore() }
 })
 
