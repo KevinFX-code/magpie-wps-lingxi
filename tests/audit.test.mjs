@@ -112,7 +112,9 @@ for (const phase of [sessionPath, runPath, chatPath]) {
 for (const [status, message, expected] of [
   [400, 'unknown model', 404], [404, 'model not found', 404],
   [422, 'invalid parameter', 404], [401, 'cookie unauthorized', 401],
-  [403, 'permission denied', 404], [503, 'unavailable', 503],
+  // PermissionDenied 是 agent-runtime 平面门禁，由 loader 自动切到 cowork_web；
+  // 这里只测 chatErrorStatus 的分类，因此用不带该文案的普通 403。
+  [403, 'forbidden', 404], [503, 'unavailable', 503],
   [400, '审核服务异常', 404], [400, 'NotAuditFailedYet', 404],
 ]) {
   test(`non-audit classification remains ${status}/${message} -> ${expected}`, async () => {

@@ -24,36 +24,37 @@
 一个 magpie / OpenCode 供应商插件：登录 WPS 灵犀，把它的模型接进 Magpie、DeepSeek Harness、
 Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 
-**桌面端对齐（灵犀 1.3.31）**：11 个默认模型、1 条对话通路、3 个请求步骤（建会话 → 领 run → chat/completions）。
+**桌面端对齐（灵犀 1.3.31）**：11 个默认模型、主通路 3 个请求步骤（建会话 → 领 run → chat/completions）。本 fork 额外提供 `cowork_web` WebSocket 回退。
 
 ---
 
 ## 🌟 核心特性
 
-- 🖥 **只走桌面客户端通路**  
-  与安装包里的 app-server 完全一致：`POST /api/aioffice/v1/cowork/sessions` 建会话 →
+- 🖥 **默认走桌面客户端通路**
+  `POST /api/aioffice/v1/cowork/sessions` 建会话 →
   `POST /api/public/v1/credits/runs` 领 run → `POST /api/public/v1/agent-runtime/chat/completions` 对话。
   原生 `messages` / `tools` 进，原生 `tool_calls` / `reasoning_content` / `usage` 出。
-- 🧹 **没有网页平面**  
-  旧的 `/api/aigc/v3/assistant/...` 通路、`question` 压平、`<|FunctionCallBegin|>` 正文工具桥全部删除；
-  不存在“有 tools 走一条、没 tools 走另一条”的分叉。
-- 🎁 **每日签到 + 一次性任务 (`auth.checkin`)**  
+- 🧹 **没有旧网页平面**
+  旧的 `/api/aigc/v3/assistant/...` 通路、`question` 压平、`<|FunctionCallBegin|>` 正文工具桥全部删除。
+- 🛟 **agent-runtime 被拒时自动回退**
+  当前上游对部分账号的 `agent-runtime/chat/completions` 返回 `403 PermissionDenied`；本 fork 识别该错误后切到官方桌面端仍在使用的 `cowork_web` WebSocket 平面。回退通路将 `messages` 压成一次 `user.input`，适合普通文本对话，不承诺原生 `tool_calls`。可用 `MAGPIE_LINGXI_PLANE=cowork_web` 直接启用。
+- 🎁 **每日签到 + 一次性任务 (`auth.checkin`)**
   读客户端任务中心 `GET /api/public/v1/tasks`，领取 `daily_check_in`；
   已领过返回 `done`，领到返回 `claimed` 并用领前/领后余额差作为奖励。
   一次性任务**全自动**：上游已判 `claimable` 的直接领；「专家模式 + 使用客户端」
   用一次双标志对话完成；「体验群聊」走网页端同款流程（`cowork_web` 会话 +
   WS `user.input` → 建群 → 解散）。干净账号实测三任务一次签到全部翻转领取。
-- 📊 **智点额度 (`auth.usage`)**  
+- 📊 **智点额度 (`auth.usage`)**
   `GET /api/public/v1/credits/balance`：`total_balance` 为剩余，`bonus_summary.total_value/total_consumed`
   给已用比例；钱包型账号（没有总额）也返回有限 `used`，不会从路由里消失。
-- ⏳ **临时积分（快到期的那部分）**  
+- ⏳ **临时积分（快到期的那部分）**
   赠送批次按 `expire_time` 分档：**15 天内到期**的单独显示成「临时积分」窗口，
   带余额和到期日（判据与 jet 插件一致；`MAGPIE_LINGXI_TEMP_DAYS` 可改天数）。
   优先消耗由服务端决定，这里只负责让你看见“哪部分马上要过期”。
-- 🔄 **模型目录 (`provider.models`)**  
+- 🔄 **模型目录 (`provider.models`)**
   只读客户端自己的 `GET /api/aioffice/v1/sessions/plans`（只取 `data.models`，带倍率与推理档位）；
   未登录时用手指量的快照，不假装实时。
-- 🔑 **账号导入 + 多账号**  
+- 🔑 **账号导入 + 多账号**
   三条登录路：浏览器登录自己抓会话、导入本机灵犀客户端登录态（Windows，读客户端 Cookie 库）、
   或直接粘贴 `wps_sid` / 整段 Cookie 兜底。
   凭据只保留 `wps_sid` 与 `uid`，按 `uid` 区分账号，第二个账号不会覆盖第一个。

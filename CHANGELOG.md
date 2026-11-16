@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5-google-q-dot.1 — 2026-11-13
+
+- 修复部分账号在当前上游（桌面端 1.3.36 / app-server 5.24.0）下调用 `agent-runtime/chat/completions` 返回 `403 PermissionDenied` 的问题。
+- 识别该错误后自动回退到官方桌面端仍在使用的 `cowork_web` 平面：`POST /api/aioffice/v1/cowork/sessions` → `WSS /api/aioffice/v1/cowork/sessions/{id}/sandbox/completions/ws` → `user.input`，并把事件流还原成 OpenAI chat completion / SSE。
+- 新增 `MAGPIE_LINGXI_PLANE=cowork_web` 可直接跳过 agent-runtime 探测，适用于已确认该平面不可用的账号。
+- 回退平面把 `messages` 压成单次 `user.input`，因此不承诺原生 tool_calls；普通文本、system/assistant 上下文与 usage 保持可用。
+- 新增 5 项离线回归测试；全套 157 通过、2 项真实上游测试未提供凭据而跳过。真机用同一账号验证非流式与流式均返回 200。
+
 ## 0.3.4 — 2026-11-02
 
 - 修复 Issue #9：模型目录只读取 `data.models`，不再把 `data.plans` 的模式作为聊天模型。

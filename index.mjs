@@ -20,6 +20,7 @@ const KDOCS_BASE = "https://lingxi.kdocs.cn"
 const AGENT_SESSIONS_PATH = "/api/aioffice/v1/cowork/sessions"
 const AGENT_RUNS_PATH = "/api/public/v1/credits/runs"
 const AGENT_CHAT_PATH = "/api/public/v1/agent-runtime/chat/completions"
+const COWORK_WS_PATH = "/api/aioffice/v1/cowork/sessions"
 const CLIENT_TYPE = "lingxi_claw"
 const CLIENT_LANG = "zh-CN"
 const RUN_TTL_MS = 60 * 60 * 1000
@@ -1310,6 +1311,194 @@ function chatErrorStatus(error) {
   return status >= 500 ? status : 502
 }
 
+// 2026-11：上游开始对部分账号的 agent-runtime 平面返回 403 PermissionDenied。
+// 官方桌面端此时仍能在 cowork_web 平面正常对话，因此把这类故障保留为
+// 可切换平面的信号，而不是伪装成 404「模型不存在」。
+function isAgentPlaneDenied(error) {
+  return Number(error?.status) === 403 && /PermissionDenied|无权限/i.test(String(error?.message || ""))
+}
+
+let coworkWSFactory = null
+function openCoworkSocket(url, options) {
+  return (coworkWSFactory || ((u, o) => new WebSocket(u, o)))(url, options)
+}
+
+function usageFromCoworkEvent(event) {
+  const raw = event?.data?.full_content?.usage
+  if (!raw || typeof raw !== "object") return null
+  const input = Number(raw.input_tokens ?? raw.prompt_tokens ?? 0) || 0
+  const output = Number(raw.output_tokens ?? raw.completion_tokens ?? 0) || 0
+  if (!input && !output) return null
+  return normalizeUsage({ prompt_tokens: input, completion_tokens: output })
+}
+
+// cowork_web 通路把 OpenAI messages 压成一次 user.input。工具调用无法原样透传，
+// 所以只在 agent-runtime 被上游拒绝时启用，且明确告知调用方这是降级模式。
+function webPromptFromMessages(messages) {
+  const lines = []
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const role = String(message?.role || "user")
+    const content = typeof message?.content === "string"
+      ? message.content
+      : Array.isArray(message?.content)
+        ? message.content.map((part) => typeof part?.text === "string" ? part.text : "").join(" ")
+        : ""
+    if (content.trim()) lines.push(`${role}: ${content}`)
+    else if (Array.isArray(message?.tool_calls) && message.tool_calls.length) {
+      lines.push(`${role}: [tool_calls=${JSON.stringify(message.tool_calls).slice(0, 2000)}]`)
+    }
+  }
+  return lines.join("\n\n").trim()
+}
+
+async function coworkWebChat({ cookie, base, body, stream, requestedModel, signal, errorResponse }) {
+  if (!coworkWSFactory && typeof WebSocket !== "function") {
+    return errorResponse("当前运行环境不支持 WebSocket，无法回退到 cowork_web 通路", 502)
+  }
+  const prompt = webPromptFromMessages(body.messages)
+  if (!prompt) return errorResponse("没有可发送的消息内容", 400, "invalid_request")
+  let sessionId
+  try {
+    sessionId = await createCoworkSession(base, cookie, signal, {
+      session_type: "cowork_web",
+      agent_version: 2,
+      env: { work_space_dir: "/home/lingxi/workspace" },
+    })
+  } catch (error) {
+    return errorResponse(error?.message || String(error), chatErrorStatus(error), chatErrorCode(error))
+  }
+
+  const id = `chatcmpl-lingxi-${Date.now()}`
+  const created = Math.floor(Date.now() / 1000)
+  const sse = (value) => `data: ${JSON.stringify(value)}\n\n`
+  const chunk = (delta, finishReason = null) => sse({
+    id, object: "chat.completion.chunk", created, model: requestedModel,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })
+  const queue = []
+  const encoder = new TextEncoder()
+  let content = ""
+  let reasoning = ""
+  let usage = null
+  let webError = null
+  let closed = false
+  let wake = null
+  let ws
+  let timeout
+  let resolveDone
+  const done = new Promise((resolve) => { resolveDone = resolve })
+  const notify = () => { const fn = wake; wake = null; fn?.() }
+  const finish = (error = null) => {
+    if (closed) return
+    closed = true
+    clearTimeout(timeout)
+    try { ws?.close() } catch {}
+    if (error) {
+      webError = error
+      queue.push(sse({ error: { message: error.message, type: "upstream_error", code: error.code || "upstream_error" } }))
+    } else {
+      queue.push(chunk({}, "stop"))
+      if (usage) queue.push(sse({ id, object: "chat.completion.chunk", created, model: requestedModel, choices: [], usage }))
+      queue.push("data: [DONE]\n\n")
+    }
+    notify()
+    resolveDone()
+  }
+  timeout = setTimeout(() => finish(Object.assign(new Error("cowork_web 通路等待上游响应超时"), { code: "upstream_error" })), 240000)
+
+  try {
+    ws = openCoworkSocket(`${base.replace(/^http/, "ws")}${COWORK_WS_PATH}/${sessionId}/sandbox/completions/ws`, {
+      headers: { Cookie: clientCookie(cookie), Origin: base, "User-Agent": UA },
+    })
+  } catch (error) {
+    finish(Object.assign(new Error(`cowork_web 连接失败：${error?.message || String(error)}`), { code: "upstream_error" }))
+  }
+  if (ws) {
+    ws.onopen = () => {
+      const agentInput = {
+        text: prompt,
+        files: [],
+        file_ids: [],
+        expect_model: requestedModel,
+        refs: [],
+        webpage_edit_selections: [],
+        permission_mode: "default",
+        current_mode: "agent",
+        browser_plugin_enabled: false,
+      }
+      if (typeof body.reasoning_effort === "string" && body.reasoning_effort.trim()) {
+        agentInput.reasoning_effort = body.reasoning_effort.trim()
+      }
+      if (Number.isInteger(body.max_tokens) && body.max_tokens > 0) agentInput.max_tokens = body.max_tokens
+      ws.send(JSON.stringify({ event: "user.input", data: { agent_input: agentInput } }))
+    }
+    ws.onmessage = (event) => {
+      let frame
+      try { frame = JSON.parse(typeof event.data === "string" ? event.data : String(event.data)) } catch { return }
+      const merged = { ...frame, ...(frame?.data && typeof frame.data === "object" ? frame.data : {}) }
+      if (isAuditError(merged) || frame?.event === "error" || frame?.event === "force.stop") {
+        const code = isAuditError(merged) ? "audit_blocked" : "upstream_error"
+        finish(Object.assign(new Error(textOfPayload(merged) || "cowork_web 上游返回错误"), { code }))
+        return
+      }
+      if (frame?.event === "component.content") {
+        const delta = String(frame.data?.delta ?? "")
+        if (!delta) return
+        if (frame.data?.type === "c_text") {
+          content += delta
+          queue.push(chunk({ content: delta }))
+        } else if (frame.data?.type === "c_reasoning") {
+          reasoning += delta
+          queue.push(chunk({ reasoning_content: delta }))
+        }
+        notify()
+      }
+      if (frame?.event === "component.end") {
+        usage = usageFromCoworkEvent(frame) || usage
+        if (frame?.data?.type === "c_reasoning" && typeof frame.data.full_content === "string") {
+          const extra = frame.data.full_content
+          if (extra && extra !== reasoning) {
+            reasoning = extra
+            queue.push(chunk({ reasoning_content: extra }))
+            notify()
+          }
+        }
+      }
+      if (["run.end", "stream.end", "done"].includes(frame?.event)) finish()
+    }
+    ws.onerror = () => finish(Object.assign(new Error("cowork_web WebSocket 连接失败"), { code: "upstream_error" }))
+    ws.onclose = () => finish()
+    signal?.addEventListener?.("abort", () => finish(Object.assign(new Error("请求已取消"), { code: "upstream_error" })), { once: true })
+  }
+
+  if (stream) {
+    const streamBody = new ReadableStream({
+      async start(controller) {
+        while (!closed || queue.length) {
+          if (!queue.length) await new Promise((resolve) => { wake = resolve })
+          wake = null
+          while (queue.length) controller.enqueue(encoder.encode(queue.shift()))
+        }
+        controller.close()
+      },
+      cancel() { finish() },
+    })
+    return new Response(streamBody, {
+      headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" },
+    })
+  }
+
+  await done
+  if (webError) return errorResponse(webError.message, webError.code === "audit_blocked" ? 400 : 502, webError.code)
+  const message = { role: "assistant", content }
+  if (reasoning) message.reasoning_content = reasoning
+  return new Response(JSON.stringify({
+    id, object: "chat.completion", created, model: requestedModel,
+    choices: [{ index: 0, message, finish_reason: "stop" }],
+    ...(usage ? { usage } : {}),
+  }), { headers: { "Content-Type": "application/json" } })
+}
+
 async function agentChat({ cookie, body, stream, requestedModel, signal, errorResponse, clientType, sessionMode }) {
   if (!isChatModelId(requestedModel)) {
     return errorResponse(`WPS 灵犀不支持此聊天模型：${requestedModel}`, 404, "model_not_found")
@@ -2306,10 +2495,20 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             const stream = body.stream !== false
             const requestedModel = wireModel(body.model)
 
-            // 桌面客户端只有一条通路：cowork 会话 → credits/run → agent-runtime。
-            // 网页平面（/api/aigc/v3/assistant/* 的 question 压平与正文工具桥）已移除。
+            // 先走 agent-runtime；若上游对该平面返回 PermissionDenied，则切到
+            // 当前桌面端仍可用的 cowork_web WebSocket 通路。
             try {
-              return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
+              if (process.env.MAGPIE_LINGXI_PLANE === "cowork_web") {
+                return await coworkWebChat({ cookie, base, body, stream, requestedModel, signal, errorResponse })
+              }
+              try {
+                return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
+              } catch (error) {
+                if (!isAgentPlaneDenied(error)) throw error
+                runs.clear()
+                console.warn("[magpie-wps-lingxi] agent-runtime 返回 PermissionDenied，改用 cowork_web 通路")
+                return await coworkWebChat({ cookie, base, body, stream, requestedModel, signal, errorResponse })
+              }
             } catch (error) {
               signal?.throwIfAborted()
               return errorResponse(error?.message || String(error), chatErrorStatus(error), chatErrorCode(error))
@@ -2502,6 +2701,10 @@ export const _internal = {
   createGroupChatWith,
   deleteGroupChat,
   agentChat,
+  coworkWebChat,
+  isAgentPlaneDenied,
+  webPromptFromMessages,
+  setCoworkWSFactory(fn) { coworkWSFactory = fn },
   sanitizeSchema,
   normalizeUsage,
   filterTools,
