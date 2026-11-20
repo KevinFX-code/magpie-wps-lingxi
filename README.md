@@ -169,7 +169,7 @@ magpie plugin add /path/to/magpie-wps-lingxi
 > ```bash
 > magpie plugin add @kevinfx/magpie-wps-lingxi
 > ```
-> 也可以直接从 GitHub 主线安装：`magpie plugin add github:KevinFX-code`.
+> 也可以直接从 GitHub 主线安装：`magpie plugin add github:KevinFX-code/magpie-wps-lingxi`.
 
 ---
 
