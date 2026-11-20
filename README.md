@@ -12,11 +12,11 @@
 
 > **来源与维护**：0.3.0 起以**桌面端 agent-runtime** 为主通路，不再使用旧 AIGC 对话端点。代码基线取自
 > [baijiu666/magpie-wps-lingxi](https://github.com/baijiu666/magpie-wps-lingxi) 0.4.11，
-> 其中合入了 [PR #3](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/3)（shadyrispy：
-> agent-runtime 平面 + Cookie 归一化）、[PR #4](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/4)
-> （kvoon3：`variants` 形状）、[PR #8](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/8)
-> （411304344：粘贴 Cookie 登录）、[PR #7](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/7)
-> （MYCF711）与 [PR #5](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/5)（baijiu666：任务中心一次性任务）
+> 其中合入了 [PR #3](https://github.com/KevinFX-code/pull/3)（shadyrispy：
+> agent-runtime 平面 + Cookie 归一化）、[PR #4](https://github.com/KevinFX-code/pull/4)
+> （kvoon3：`variants` 形状）、[PR #8](https://github.com/KevinFX-code/pull/8)
+> （411304344：粘贴 Cookie 登录）、[PR #7](https://github.com/KevinFX-code/pull/7)
+> （MYCF711）与 [PR #5](https://github.com/KevinFX-code/pull/5)（baijiu666：任务中心一次性任务）
 > 的工作。0.1.x–0.2.x 的网页端实现仍保留在 git 历史里（含 `v0.2.3` 标签）。
 >
 > 0.3.0 起基于该桌面端实现持续改进；各版本变化见 [CHANGELOG](./CHANGELOG.md)。
@@ -149,7 +149,7 @@ MAGPIE_LINGXI_PLANE=cowork_web     # 可选：强制纯文本 cowork_web 通路�
 
 ```bash
 # 从本仓库源码安装
-magpie plugin add github:KevinFX-code/magpie-wps-lingxi
+magpie plugin add github:KevinFX-code
 
 # 或在本地开发目录
 magpie plugin add /path/to/magpie-wps-lingxi
@@ -159,17 +159,17 @@ magpie plugin add /path/to/magpie-wps-lingxi
 
 ```json
 {
-  "plugins": [{ "spec": "github:KevinFX-code/magpie-wps-lingxi" }]
+  "plugins": [{ "spec": "github:KevinFX-code" }]
 }
 ```
 
 > 安装前先关掉上游同名插件：两者声明同一个 provider id `wps-lingxi`，同时启用会互相覆盖。
 
-> **关于 npm**：0.3.0 / 0.3.1 / 0.3.2 三次 `npm publish` 都只写进了元数据，tarball 一直 404
-> （`registry.npmjs.org` 上其他包正常、npm 状态页也全绿，怀疑是自动安全扫描扣住了这个包 ——
-> 它确实会读浏览器 Cookie 库、还会下载并执行远端二进制）。
-> 所以 **`npm` 上的 `latest` 已回退到能装的 `0.2.3`**（旧架构，网页端），
-> 0.3.x 请用上面的 `github:` 方式安装。等 npm 那边放行后再把 `latest` 推上去。
+> **通过 npm 安装（推荐）**：[`@kevinfx/magpie-wps-lingxi`](https://www.npmjs.com/package/@kevinfx/magpie-wps-lingxi) 当前 `latest` 为 `0.3.6`。在 Magpie 中运行：
+> ```bash
+> magpie plugin add @kevinfx/magpie-wps-lingxi
+> ```
+> 也可以直接从 GitHub 主线安装：`magpie plugin add github:KevinFX-code/magpie-wps-lingxi`.
 
 ---
 
