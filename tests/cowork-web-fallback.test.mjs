@@ -107,14 +107,14 @@ for (const stream of [false, true]) {
   })
 }
 
-test('tool requests retain PermissionDenied and do not enter text-only fallback', async () => {
+test('tool requests fall back to cowork_web with tools serialized as text', async () => {
   const { response, text, calls, sockets } = await exercise({ tools: true })
-  assert.equal(response.status, 403)
-  assert.equal(JSON.parse(text).error.code, 'PermissionDenied')
-  assert.match(JSON.parse(text).error.message, /不支持原生函数工具调用/)
+  assert.equal(response.status, 200)
   assert.equal(calls.filter((call) => call.path === chatPath).length, 1)
-  assert.equal(calls.filter((call) => call.path === sessionPath).length, 1)
-  assert.equal(sockets.length, 0)
+  assert.equal(sockets.length, 1)
+  // tools 定义应注入 prompt
+  assert.match(sockets[0].sent[0].data.agent_input.text, /工具名：exec/)
+  assert.match(sockets[0].sent[0].data.agent_input.text, /tool_call/)
 })
 
 test('PermissionDenied while creating agent session also falls back without a login hint', async () => {
@@ -126,12 +126,11 @@ test('PermissionDenied while creating agent session also falls back without a lo
   assert.equal(sockets.length, 1)
 })
 
-test('forced cowork_web mode refuses tools and multimodal content', async () => {
+test('forced cowork_web mode accepts tools and refuses only multimodal content', async () => {
   const tools = await exercise({ plane: 'cowork_web', tools: true })
-  assert.equal(tools.response.status, 400)
-  assert.equal(JSON.parse(tools.text).error.code, 'unsupported_request')
-  assert.equal(tools.calls.filter((call) => call.path === chatPath).length, 0)
-  assert.equal(tools.sockets.length, 0)
+  assert.equal(tools.response.status, 200)
+  assert.equal(tools.sockets.length, 1)
+  assert.match(tools.sockets[0].sent[0].data.agent_input.text, /工具名：exec/)
   assert.match(_internal.coworkWebUnsupportedReason({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }] }] }), /纯文本/)
 })
 
@@ -192,9 +191,10 @@ test('PermissionDenied in one thread does not invalidate another thread run', as
       }),
     })
     assert.equal((await request('thread-a', 'first')).status, 200)
-    assert.equal((await request('thread-b', 'deny')).status, 403)
+    // deny 请求带 tools，PermissionDenied 后走 cowork_web（WebSocket mock 未设置，返回 502）
+    assert.equal((await request('thread-b', 'deny')).status, 502)
     assert.equal((await request('thread-a', 'second')).status, 200)
-    assert.equal(calls.filter((call) => call.path === sessionPath).length, 2)
+    assert.equal(calls.filter((call) => call.path === sessionPath).length, 3)
     assert.equal(calls.filter((call) => call.path === runPath).length, 2)
     assert.equal(calls.filter((call) => call.path === chatPath).length, 3)
   } finally {

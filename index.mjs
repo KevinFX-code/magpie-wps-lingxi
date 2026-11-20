@@ -1494,12 +1494,7 @@ function chatErrorStatus(error) {
 }
 
 function coworkWebUnsupportedReason(body) {
-  if (Array.isArray(body?.tools) && body.tools.length) return "cowork_web 降级通路不支持原生函数工具调用"
-  if (body?.tool_choice && !["auto", "none"].includes(body.tool_choice)) return "cowork_web 降级通路不支持 tool_choice"
   for (const message of Array.isArray(body?.messages) ? body.messages : []) {
-    if (message?.role === "tool" || (Array.isArray(message?.tool_calls) && message.tool_calls.length)) {
-      return "cowork_web 降级通路不支持带工具调用记录的上下文"
-    }
     if (Array.isArray(message?.content) && message.content.some((part) =>
       typeof part?.text !== "string" || (part.type && !["text", "input_text", "output_text"].includes(part.type)))) {
       return "cowork_web 降级通路仅支持纯文本消息"
@@ -1508,19 +1503,105 @@ function coworkWebUnsupportedReason(body) {
   return ""
 }
 
-function webPromptFromMessages(messages) {
-  const lines = []
-  for (const message of Array.isArray(messages) ? messages : []) {
-    if (message?.role === "tool" || (Array.isArray(message?.tool_calls) && message.tool_calls.length)) {
-      throw invalidChatRequest("cowork_web 降级通路不支持原生函数工具调用")
+// ── cowork_web 工具调用文本协议 ──────────────────────────────────────────
+// cowork_web 不支持原生 tools，把工具定义/调用/结果全部序列化为文本注入 prompt，
+// 模型按约定格式输出工具调用，插件解析后转回 OpenAI tool_calls。
+
+const TOOL_CALL_OPEN = "<tool_call>"
+const TOOL_CALL_CLOSE = "</tool_call>"
+const TOOL_RESULT_OPEN = "<tool_result>"
+const TOOL_RESULT_CLOSE = "</tool_result>"
+
+function toolsToPrompt(tools) {
+  if (!Array.isArray(tools) || !tools.length) return ""
+  const lines = [
+    "你可以通过输出特定格式来调用工具。可用工具列表：",
+    "",
+  ]
+  for (const tool of tools) {
+    const fn = tool?.function
+    if (!fn?.name) continue
+    lines.push(`工具名：${fn.name}`)
+    if (fn.description) lines.push(`描述：${fn.description}`)
+    if (fn.parameters) lines.push(`参数（JSON Schema）：${JSON.stringify(fn.parameters)}`)
+    lines.push("")
+  }
+  lines.push(
+    "调用工具时，请严格按以下格式输出（可以多次调用）：",
+    `${TOOL_CALL_OPEN}{"name": "工具名", "arguments": {参数对象}}${TOOL_CALL_CLOSE}`,
+    "",
+    "工具执行结果会以以下格式出现在对话中：",
+    `${TOOL_RESULT_OPEN}工具返回的内容${TOOL_RESULT_CLOSE}`,
+    "",
+    "请根据工具返回结果继续回答。如果不需要调用工具，直接正常回复即可。",
+  )
+  return lines.join("\n")
+}
+
+function toolCallsToText(toolCalls) {
+  return (Array.isArray(toolCalls) ? toolCalls : []).map((tc) => {
+    const name = tc?.function?.name || tc?.name || "unknown"
+    let args = tc?.function?.arguments ?? tc?.arguments ?? {}
+    if (typeof args === "string") {
+      try { args = JSON.parse(args) } catch { /* keep as-is */ }
     }
+    return `${TOOL_CALL_OPEN}${JSON.stringify({ name, arguments: args })}${TOOL_CALL_CLOSE}`
+  }).join("\n")
+}
+
+function parseToolCalls(text) {
+  if (typeof text !== "string" || !text.includes(TOOL_CALL_OPEN)) return { text, calls: [] }
+  const calls = []
+  let remaining = ""
+  let pos = 0
+  while (pos < text.length) {
+    const start = text.indexOf(TOOL_CALL_OPEN, pos)
+    if (start === -1) { remaining += text.slice(pos); break }
+    remaining += text.slice(pos, start)
+    const end = text.indexOf(TOOL_CALL_CLOSE, start + TOOL_CALL_OPEN.length)
+    if (end === -1) { remaining += text.slice(start); break }
+    const raw = text.slice(start + TOOL_CALL_OPEN.length, end).trim()
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed.name) {
+        calls.push({
+          id: `call_${Date.now()}_${calls.length}`,
+          type: "function",
+          function: { name: parsed.name, arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments || {}) },
+        })
+      } else {
+        remaining += text.slice(start, end + TOOL_CALL_CLOSE.length)
+      }
+    } catch {
+      remaining += text.slice(start, end + TOOL_CALL_CLOSE.length)
+    }
+    pos = end + TOOL_CALL_CLOSE.length
+  }
+  return { text: remaining.trim(), calls }
+}
+
+function webPromptFromMessages(messages, tools) {
+  const lines = []
+  const toolsPrompt = toolsToPrompt(tools)
+  if (toolsPrompt) lines.push(toolsPrompt)
+  for (const message of Array.isArray(messages) ? messages : []) {
     const role = String(message?.role || "user")
+    if (message?.role === "tool") {
+      const content = typeof message?.content === "string" ? message.content : JSON.stringify(message?.content || "")
+      lines.push(`${TOOL_RESULT_OPEN}${content}${TOOL_RESULT_CLOSE}`)
+      continue
+    }
     const content = typeof message?.content === "string"
       ? message.content
       : Array.isArray(message?.content)
         ? message.content.map((part) => typeof part?.text === "string" ? part.text : "").join(" ")
         : ""
-    if (content.trim()) lines.push(`${role}: ${content}`)
+    const parts = []
+    if (content.trim()) parts.push(content)
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length) {
+      parts.push(toolCallsToText(message.tool_calls))
+    }
+    if (parts.length) lines.push(`${role}: ${parts.join("\n")}`)
   }
   return lines.join("\n\n").trim()
 }
@@ -1547,7 +1628,8 @@ function coworkUsage(event) {
 async function coworkWebChat({ cookie, base, body, stream, requestedModel, signal, errorResponse }) {
   const unsupported = coworkWebUnsupportedReason(body)
   if (unsupported) return errorResponse(unsupported, 400, "unsupported_request")
-  const prompt = webPromptFromMessages(body.messages)
+  const { tools } = filterTools(body.tools)
+  const prompt = webPromptFromMessages(body.messages, tools)
   if (!prompt) return errorResponse("没有可发送的消息内容", 400, "invalid_request")
 
   let sessionId
@@ -1591,7 +1673,17 @@ async function coworkWebChat({ cookie, base, body, stream, requestedModel, signa
       webError = error
       queue.push(sse({ error: { message: error.message, type: "upstream_error", code: error.code || "upstream_error" } }))
     } else {
-      queue.push(chunk({}, "stop"))
+      // 解析工具调用：从完整文本中提取 <tool_call> 标记
+      const { text: cleanText, calls } = parseToolCalls(content)
+      if (calls.length) {
+        // 有工具调用：发出 tool_calls delta，finish_reason 为 tool_calls
+        for (const call of calls) {
+          queue.push(chunk({ tool_calls: [{ index: calls.indexOf(call), ...call }] }))
+        }
+        queue.push(chunk({}, "tool_calls"))
+      } else {
+        queue.push(chunk({}, "stop"))
+      }
       if (usage) queue.push(sse({ id, object: "chat.completion.chunk", created, model: requestedModel, choices: [], usage }))
       queue.push("data: [DONE]\n\n")
     }
@@ -1698,11 +1790,14 @@ async function coworkWebChat({ cookie, base, body, stream, requestedModel, signa
 
   await done
   if (webError) return errorResponse(webError.message, chatErrorStatus(webError), chatErrorCode(webError))
-  const message = { role: "assistant", content }
+  const { text: cleanText, calls } = parseToolCalls(content)
+  const message = { role: "assistant", content: cleanText }
   if (reasoning) message.reasoning_content = reasoning
+  const finishReason = calls.length ? "tool_calls" : "stop"
+  if (calls.length) message.tool_calls = calls
   return new Response(JSON.stringify({
     id, object: "chat.completion", created, model: requestedModel,
-    choices: [{ index: 0, message, finish_reason: "stop" }],
+    choices: [{ index: 0, message, finish_reason: finishReason }],
     ...(usage ? { usage } : {}),
   }), { headers: { "Content-Type": "application/json" } })
 }
@@ -2700,7 +2795,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             const stream = body.stream !== false
             const requestedModel = wireModel(body.model)
 
-            // agent-runtime 为主通路；明确的 PermissionDenied 才尝试 cowork_web。
+            // agent-runtime 为主通路；明确的 PermissionDenied 时所有请求（含 tools）都走 cowork_web。
             try {
               if (process.env.MAGPIE_LINGXI_PLANE === "cowork_web") {
                 const requestBody = normalizeResponsesRequest(body)
@@ -2715,7 +2810,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 if (unsupported) {
                   return errorResponse(`${error.message}；${unsupported}，已保留 PermissionDenied 状态`, 403, "PermissionDenied")
                 }
-                console.warn("[magpie-wps-lingxi] agent-runtime 返回 PermissionDenied，文本请求改用 cowork_web 通路")
+                console.warn("[magpie-wps-lingxi] agent-runtime 返回 PermissionDenied，改用 cowork_web 通路（含工具调用）")
                 return await coworkWebChat({ cookie, base, body: requestBody, stream, requestedModel, signal, errorResponse })
               }
             } catch (error) {
@@ -2929,4 +3024,7 @@ export const _internal = {
   browserLogin,
   safariLogin,
   chromiumLogin,
+  parseToolCalls,
+  toolsToPrompt,
+  toolCallsToText,
 }

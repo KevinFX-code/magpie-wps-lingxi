@@ -235,12 +235,17 @@ for (const stream of [false, true]) {
 
     try {
       const denied = await request()
-      const deniedBody = await denied.json()
-      assert.equal(denied.status, 403)
-      assert.equal(deniedBody.error.code, 'PermissionDenied')
-      assert.match(deniedBody.error.message, /PermissionDenied/)
-      assert.match(deniedBody.error.message, /无权限/)
-      assert.equal(sessions, 1)
+      // 带 tools 的请求在 PermissionDenied 后走 cowork_web 降级
+      // 非流式：WebSocket mock 未设置，返回 502
+      // 流式：Response 状态码是 200（流已建立），错误通过 SSE 帧传递
+      if (stream) {
+        assert.equal(denied.status, 200)
+        const deniedText = await denied.text()
+        assert.match(deniedText, /error/)
+      } else {
+        assert.equal(denied.status, 502)
+      }
+      assert.equal(sessions, 2, 'agent session + cowork_web session')
       assert.equal(runs, 1)
       assert.equal(chats, 1, 'permission failure must not retry the same request')
       assert.equal(authReads, 1, 'permission failure must not request another credential')
@@ -253,7 +258,7 @@ for (const stream of [false, true]) {
       } else {
         assert.equal((await recovered.json()).choices[0].message.content, 'recovered')
       }
-      assert.equal(sessions, 2, 'the next request must create a fresh session')
+      assert.equal(sessions, 3, 'agent session + cowork_web session + fresh session for retry')
       assert.equal(runs, 2, 'the next request must create a fresh run')
       assert.equal(chats, 2)
       assert.equal(authReads, 2)
