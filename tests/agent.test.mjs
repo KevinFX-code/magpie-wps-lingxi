@@ -229,6 +229,7 @@ for (const stream of [false, true]) {
         model,
         stream,
         messages: [{ role: 'user', content: 'hello' }],
+        tools: [{ type: 'function', function: { name: 'exec_command', parameters: { type: 'object' } } }],
       }),
     })
 
