@@ -12,11 +12,11 @@
 
 > **来源与维护**：0.3.0 起以**桌面端 agent-runtime** 为主通路，不再使用旧 AIGC 对话端点。代码基线取自
 > [baijiu666/magpie-wps-lingxi](https://github.com/baijiu666/magpie-wps-lingxi) 0.4.11，
-> 其中合入了 [PR #3](https://github.com/KevinFX-code/pull/3)（shadyrispy：
-> agent-runtime 平面 + Cookie 归一化）、[PR #4](https://github.com/KevinFX-code/pull/4)
-> （kvoon3：`variants` 形状）、[PR #8](https://github.com/KevinFX-code/pull/8)
-> （411304344：粘贴 Cookie 登录）、[PR #7](https://github.com/KevinFX-code/pull/7)
-> （MYCF711）与 [PR #5](https://github.com/KevinFX-code/pull/5)（baijiu666：任务中心一次性任务）
+> 其中合入了 [PR #3](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/3)（shadyrispy：
+> agent-runtime 平面 + Cookie 归一化）、[PR #4](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/4)
+> （kvoon3：`variants` 形状）、[PR #8](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/8)
+> （411304344：粘贴 Cookie 登录）、[PR #7](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/7)
+> （MYCF711）与 [PR #5](https://github.com/KevinFX-code/magpie-wps-lingxi/pull/5)（baijiu666：任务中心一次性任务）
 > 的工作。0.1.x–0.2.x 的网页端实现仍保留在 git 历史里（含 `v0.2.3` 标签）。
 >
 > 0.3.0 起基于该桌面端实现持续改进；各版本变化见 [CHANGELOG](./CHANGELOG.md)。
@@ -149,7 +149,7 @@ MAGPIE_LINGXI_PLANE=cowork_web     # 可选：强制纯文本 cowork_web 通路�
 
 ```bash
 # 从本仓库源码安装
-magpie plugin add github:KevinFX-code
+magpie plugin add github:KevinFX-code/magpie-wps-lingxi
 
 # 或在本地开发目录
 magpie plugin add /path/to/magpie-wps-lingxi
@@ -159,7 +159,7 @@ magpie plugin add /path/to/magpie-wps-lingxi
 
 ```json
 {
-  "plugins": [{ "spec": "github:KevinFX-code" }]
+  "plugins": [{ "spec": "github:KevinFX-code/magpie-wps-lingxi" }]
 }
 ```
 
