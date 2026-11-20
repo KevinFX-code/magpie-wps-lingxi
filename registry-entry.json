@@ -3,7 +3,7 @@
   "name": "WPS 灵犀",
   "providers": ["wps-lingxi"],
   "summary": {
-    "en": "Signs in to WPS Lingxi with a pasted cookie and exposes its desktop-client agent runtime as OpenAI-compatible models, plus daily check-in and credit balance.",
-    "zh": "用粘贴的 Cookie 登录 WPS 灵犀，把桌面客户端同一条 agent-runtime 通路接成 OpenAI 兼容模型，并提供每日签到与智点余额查询。"
+    "en": "Signs in to WPS Lingxi and exposes its agent runtime as OpenAI-compatible models with Responses input conversion, per-thread isolation, text-only PermissionDenied fallback, daily check-in, and credit balance.",
+    "zh": "登录 WPS 灵犀并提供 OpenAI 兼容模型，支持 Responses 输入转换、按会话隔离、PermissionDenied 纯文本回退，以及每日签到和智点查询。"
   }
 }

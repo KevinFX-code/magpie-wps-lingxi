@@ -12,6 +12,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: node --check index.mjs
       - run: node --test
   live:
@@ -23,6 +24,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Live upstream check (skips when the secret is absent)
         run: node --test tests/live.test.mjs
         timeout-minutes: 8

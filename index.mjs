@@ -1,6 +1,6 @@
 // WPS 灵犀 (Lingxi) Provider Plugin for Magpie / OpenCode
-// 桌面客户端专用：cowork 会话 → credits/run → agent-runtime（安装包 1.3.31 取证）。
-// 同时提供每日签到、智点额度与客户端模型目录；不再使用网页端通路。
+// 桌面端 agent-runtime 为主通路；明示 PermissionDenied 时纯文本可回退到 cowork_web。
+// 同时提供每日签到、智点额度与客户端模型目录；不再使用旧 AIGC 对话端点。
 
 import { createServer } from "node:http"
 import { createDecipheriv, createHash } from "node:crypto"
@@ -8,9 +8,10 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import { join } from "node:path"
 import { homedir, tmpdir, userInfo } from "node:os"
 import { exec, execFileSync, spawn } from "node:child_process"
+import WebSocket from "ws"
 
 const PROVIDER = "wps-lingxi"
-// 只走桌面端（灵犀 1.3.31 安装包）的那一条通路，不再有网页平面：
+// 主通路对齐桌面端（灵犀 1.3.31 安装包）：
 //   建会话 POST /api/aioffice/v1/cowork/sessions
 //   领 run POST /api/public/v1/credits/runs
 //   对话   POST /api/public/v1/agent-runtime/chat/completions   (SSE，原生 messages/tools)
@@ -20,6 +21,7 @@ const KDOCS_BASE = "https://lingxi.kdocs.cn"
 const AGENT_SESSIONS_PATH = "/api/aioffice/v1/cowork/sessions"
 const AGENT_RUNS_PATH = "/api/public/v1/credits/runs"
 const AGENT_CHAT_PATH = "/api/public/v1/agent-runtime/chat/completions"
+const COWORK_WS_PATH = "/api/aioffice/v1/cowork/sessions"
 const CLIENT_TYPE = "lingxi_claw"
 const CLIENT_LANG = "zh-CN"
 const RUN_TTL_MS = 60 * 60 * 1000
@@ -872,9 +874,142 @@ function lastUserText(body) {
   return "灵犀会话"
 }
 
+function invalidChatRequest(message) {
+  const error = new Error(message)
+  error.status = 400
+  error.code = "invalid_request"
+  return error
+}
+
+function responsesContentPart(part) {
+  const type = String(part?.type || "")
+  if (["input_text", "output_text", "text", "refusal"].includes(type)) {
+    if (typeof part.text !== "string") throw invalidChatRequest(`Responses API ${type} 内容缺少 text`)
+    return { type: "text", text: part.text }
+  }
+  if (type === "input_image") {
+    const image = part.image_url
+    const url = typeof image === "string" ? image : image?.url
+    if (typeof url !== "string" || !url) throw invalidChatRequest("Responses API input_image 缺少 image_url")
+    const detail = part.detail ?? (typeof image === "object" ? image.detail : undefined)
+    return { type: "image_url", image_url: { url, ...(detail ? { detail } : {}) } }
+  }
+  throw invalidChatRequest(`不支持 Responses API 内容类型：${type || "(missing type)"}`)
+}
+
+function responsesMessage(item) {
+  const role = String(item?.role || "")
+  if (!["system", "developer", "user", "assistant"].includes(role)) {
+    throw invalidChatRequest(`不支持 Responses API 消息角色：${role || "(missing role)"}`)
+  }
+  const content = typeof item.content === "string"
+    ? item.content
+    : Array.isArray(item.content)
+      ? item.content.map(responsesContentPart)
+      : item.content == null && role === "assistant"
+        ? null
+        : (() => { throw invalidChatRequest("Responses API message.content 必须是字符串或数组") })()
+  return { role, content }
+}
+
+function responsesInputToMessages(input) {
+  if (typeof input === "string") return [{ role: "user", content: input }]
+  if (!Array.isArray(input)) throw invalidChatRequest("Responses API input 必须是字符串或数组")
+  const messages = []
+  let pendingCalls = []
+  const flushCalls = () => {
+    if (!pendingCalls.length) return
+    messages.push({ role: "assistant", content: null, tool_calls: pendingCalls })
+    pendingCalls = []
+  }
+  for (const item of input) {
+    if (item?.type === "function_call") {
+      const id = String(item.call_id || item.id || "").trim()
+      const name = String(item.name || "").trim()
+      if (!id || !name) throw invalidChatRequest("Responses API function_call 缺少 call_id 或 name")
+      const args = item.arguments ?? "{}"
+      pendingCalls.push({
+        id,
+        type: "function",
+        function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) },
+      })
+      continue
+    }
+    flushCalls()
+    if (item?.type === "function_call_output") {
+      const callId = String(item.call_id || "").trim()
+      if (!callId) throw invalidChatRequest("Responses API function_call_output 缺少 call_id")
+      const output = item.output
+      messages.push({ role: "tool", tool_call_id: callId, content: typeof output === "string" ? output : JSON.stringify(output ?? "") })
+      continue
+    }
+    if (item?.type === "reasoning") continue
+    if (item?.type === "message" || (item && typeof item.role === "string" && item.content !== undefined)) {
+      messages.push(responsesMessage(item))
+      continue
+    }
+    throw invalidChatRequest(`不支持 Responses API input 项：${String(item?.type || "(missing type)")}`)
+  }
+  flushCalls()
+  return messages
+}
+
+function normalizeResponsesTools(tools) {
+  if (!Array.isArray(tools)) return tools
+  return tools.map((tool) => {
+    if (tool?.type !== "function" || typeof tool.name !== "string") return tool
+    const fn = {
+      name: tool.name,
+      ...(tool.description ? { description: tool.description } : {}),
+      ...(tool.parameters ? { parameters: tool.parameters } : {}),
+      ...(typeof tool.strict === "boolean" ? { strict: tool.strict } : {}),
+    }
+    return { type: "function", function: fn }
+  })
+}
+
+function normalizeResponsesRequest(body) {
+  if (Array.isArray(body?.messages) && (body.messages.length || !Object.prototype.hasOwnProperty.call(body || {}, "input"))) return body
+  if (!Object.prototype.hasOwnProperty.call(body || {}, "input")) return body
+  const messages = responsesInputToMessages(body.input)
+  if (typeof body.instructions === "string" && body.instructions.trim()) {
+    messages.unshift({ role: "system", content: body.instructions })
+  }
+  const out = { ...body, messages, tools: normalizeResponsesTools(body.tools) }
+  if (body.tool_choice && typeof body.tool_choice === "object" && body.tool_choice.type === "function" && !body.tool_choice.function) {
+    out.tool_choice = { type: "function", function: { name: body.tool_choice.name } }
+  }
+  const effort = body.reasoning?.effort
+  if (typeof out.reasoning_effort !== "string" && typeof effort === "string") out.reasoning_effort = effort
+  if (!(Number.isInteger(out.max_tokens) && out.max_tokens > 0) && Number.isInteger(body.max_output_tokens) && body.max_output_tokens > 0) {
+    out.max_tokens = body.max_output_tokens
+  }
+  return out
+}
+
+function conversationThreadId(body) {
+  const values = [
+    body?.client_metadata?.thread_id,
+    body?.metadata?.thread_id,
+    body?.thread_id,
+    body?.conversation_id,
+  ]
+  const value = values.find((item) => typeof item === "string" && item.trim() && item.length <= 512)
+  return value ? value.trim() : ""
+}
+
+let uncachedRunSequence = 0
+function chatRunKey(cookie, model, clientType, sessionMode, body) {
+  const base = `${identityOf(cookie)}|${model}|${clientType || ""}|${sessionMode || ""}`
+  const threadId = conversationThreadId(body)
+  return threadId
+    ? { key: `${base}|thread:${identityOf(threadId)}`, cache: true }
+    : { key: `${base}|request:${Date.now()}:${++uncachedRunSequence}`, cache: false }
+}
+
 // ── agent-runtime 直连平面（会话 + run + chat/completions）──────────────
-// 计费按 run：一个 run 内多次调用只扣一次智点，所以按「账号 × 模型」
-// 缓存 session/run，TTL 一小时；上游报 SQLNoRows / 会话不存在时重建一次。
+// 计费按 run：一个 run 内多次调用只扣一次智点；仅按稳定会话 ID 缓存，TTL 一小时。
+// 缺少稳定会话 ID 时新建 run，避免不同对话共用同一段上游上下文。
 
 const runs = new Map()
 
@@ -909,9 +1044,16 @@ function isPermissionDenied(error) {
     String(error?.upstreamCode || "").toLowerCase() === "permissiondenied"
 }
 
+function isInvalidArgument(error) {
+  return Number(error?.status) === 400 &&
+    String(error?.upstreamCode || "").toLowerCase() === "invalidargument"
+}
+
 function chatErrorCode(error) {
+  if (error?.code === "invalid_request" || error?.code === "unsupported_request") return error.code
   if (isAuditError(error)) return "audit_blocked"
   if (isPermissionDenied(error)) return error.upstreamCode
+  if (isInvalidArgument(error)) return error.upstreamCode
   return "upstream_error"
 }
 
@@ -927,9 +1069,12 @@ async function postJson(url, cookie, base, body, signal, extra = {}) {
   try { payload = text ? JSON.parse(text) : {} } catch { payload = { message: text } }
   if (!response.ok) {
     const detail = envelopeError(payload) || textOfPayload(payload) || text.slice(0, 200)
-    const hint = !isAuditError(payload) && (response.status === 401 || response.status === 403) ? "（WPS 登录态可能已失效，请重新粘贴 Cookie）" : ""
+    const upstreamCode = upstreamErrorCode(payload)
+    const planeDenied = response.status === 403 && upstreamCode.toLowerCase() === "permissiondenied"
+    const hint = !isAuditError(payload) && !planeDenied && (response.status === 401 || response.status === 403) ? "（WPS 登录态可能已失效，请重新粘贴 Cookie）" : ""
     const error = new Error(`WPS 灵犀上游返回 ${response.status}${hint}${detail ? `：${detail}` : ""}`)
     error.status = response.status
+    if (upstreamCode) error.upstreamCode = upstreamCode
     if (isAuditError(payload)) error.code = "audit_blocked"
     throw error
   }
@@ -982,8 +1127,8 @@ async function createCreditsRun(base, cookie, sessionId, model, title, signal, {
   return { runId: id, groupId: String(payload?.data?.group_id ?? id) }
 }
 
-async function ensureRun(cookie, key, model, title, signal, extra = {}, runExtra = {}) {
-  const hit = runs.get(key)
+async function ensureRun(cookie, key, model, title, signal, extra = {}, runExtra = {}, cache = true) {
+  const hit = cache ? runs.get(key) : null
   if (hit && Date.now() - hit.at < RUN_TTL_MS) return hit
   let lastError
   // 先试 wps.cn（reference 实测的平面），404/401 再回落登录用的 kdocs 域名。
@@ -992,10 +1137,10 @@ async function ensureRun(cookie, key, model, title, signal, extra = {}, runExtra
       const sessionId = await createCoworkSession(base, cookie, signal, extra)
       const { runId, groupId } = await createCreditsRun(base, cookie, sessionId, model, title, signal, runExtra)
       const run = { base, sessionId, runId, groupId, at: Date.now() }
-      runs.set(key, run)
+      if (cache) runs.set(key, run)
       return run
     } catch (error) {
-      if (isAuditError(error)) throw error
+      if (isAuditError(error) || isPermissionDenied(error)) throw error
       lastError = error
     }
   }
@@ -1099,6 +1244,7 @@ function fitAgentBody(body) {
 function buildAgentBody(body, model) {
   const { tools } = filterTools(body.tools)
   const out = { stream: true, model, messages: Array.isArray(body.messages) ? body.messages : [] }
+  if (typeof body.parallel_tool_calls === "boolean") out.parallel_tool_calls = body.parallel_tool_calls
   if (tools.length) {
     out.tools = tools
     if (body.tool_choice != null) out.tool_choice = body.tool_choice
@@ -1330,12 +1476,14 @@ async function requestAgent(cookie, run, payload, signal, clientType) {
   return response
 }
 
-// 审核拦截是请求级 400；明确的 PermissionDenied 保留 403。
+// 审核拦截和明确的 InvalidArgument 保留请求级 400；PermissionDenied 保留 403。
 // 其余沿用既有的模型/参数错误 404、登录失效 401 映射。
 // 只有明确的鉴权失败才给 401（否则会把账号标成未登录、从路由里摘掉）。
 function chatErrorStatus(error) {
+  if (error?.code === "invalid_request" || error?.code === "unsupported_request") return 400
   if (isAuditError(error)) return 400
   if (isPermissionDenied(error)) return 403
+  if (isInvalidArgument(error)) return 400
   const status = Number(error?.status) || 0
   const text = String(error?.message || "")
   if (status === 401 || status === 403) {
@@ -1345,12 +1493,227 @@ function chatErrorStatus(error) {
   return status >= 500 ? status : 502
 }
 
+function coworkWebUnsupportedReason(body) {
+  if (Array.isArray(body?.tools) && body.tools.length) return "cowork_web 降级通路不支持原生函数工具调用"
+  if (body?.tool_choice && !["auto", "none"].includes(body.tool_choice)) return "cowork_web 降级通路不支持 tool_choice"
+  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
+    if (message?.role === "tool" || (Array.isArray(message?.tool_calls) && message.tool_calls.length)) {
+      return "cowork_web 降级通路不支持带工具调用记录的上下文"
+    }
+    if (Array.isArray(message?.content) && message.content.some((part) =>
+      typeof part?.text !== "string" || (part.type && !["text", "input_text", "output_text"].includes(part.type)))) {
+      return "cowork_web 降级通路仅支持纯文本消息"
+    }
+  }
+  return ""
+}
+
+function webPromptFromMessages(messages) {
+  const lines = []
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role === "tool" || (Array.isArray(message?.tool_calls) && message.tool_calls.length)) {
+      throw invalidChatRequest("cowork_web 降级通路不支持原生函数工具调用")
+    }
+    const role = String(message?.role || "user")
+    const content = typeof message?.content === "string"
+      ? message.content
+      : Array.isArray(message?.content)
+        ? message.content.map((part) => typeof part?.text === "string" ? part.text : "").join(" ")
+        : ""
+    if (content.trim()) lines.push(`${role}: ${content}`)
+  }
+  return lines.join("\n\n").trim()
+}
+
+let coworkWSFactory = null
+let coworkResponseSequence = 0
+function openCoworkSocket(url, options) {
+  if (coworkWSFactory) return coworkWSFactory(url, options)
+  return new WebSocket(url, {
+    headers: options?.headers,
+    handshakeTimeout: 12000,
+    perMessageDeflate: false,
+  })
+}
+
+function coworkUsage(event) {
+  const raw = event?.data?.full_content?.usage
+  if (!raw || typeof raw !== "object") return null
+  const prompt = Number(raw.input_tokens ?? raw.prompt_tokens ?? 0) || 0
+  const completion = Number(raw.output_tokens ?? raw.completion_tokens ?? 0) || 0
+  return prompt || completion ? normalizeUsage({ prompt_tokens: prompt, completion_tokens: completion }) : null
+}
+
+async function coworkWebChat({ cookie, base, body, stream, requestedModel, signal, errorResponse }) {
+  const unsupported = coworkWebUnsupportedReason(body)
+  if (unsupported) return errorResponse(unsupported, 400, "unsupported_request")
+  const prompt = webPromptFromMessages(body.messages)
+  if (!prompt) return errorResponse("没有可发送的消息内容", 400, "invalid_request")
+
+  let sessionId
+  try {
+    sessionId = await createCoworkSession(base, cookie, signal, {
+      session_type: "cowork_web",
+      agent_version: 2,
+    })
+  } catch (error) {
+    return errorResponse(error?.message || String(error), chatErrorStatus(error), chatErrorCode(error))
+  }
+
+  const id = `chatcmpl-lingxi-${Date.now()}-${++coworkResponseSequence}`
+  const created = Math.floor(Date.now() / 1000)
+  const sse = (value) => `data: ${JSON.stringify(value)}\n\n`
+  const chunk = (delta, finishReason = null) => sse({
+    id, object: "chat.completion.chunk", created, model: requestedModel,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })
+  const queue = []
+  const encoder = new TextEncoder()
+  let content = ""
+  let reasoning = ""
+  let usage = null
+  let webError = null
+  let closed = false
+  let wake = null
+  let ws
+  let timeout
+  let resolveDone
+  let abortHandler
+  const done = new Promise((resolve) => { resolveDone = resolve })
+  const notify = () => { const fn = wake; wake = null; fn?.() }
+  const finish = (error = null) => {
+    if (closed) return
+    closed = true
+    clearTimeout(timeout)
+    if (abortHandler) signal?.removeEventListener?.("abort", abortHandler)
+    try { ws?.close() } catch {}
+    if (error) {
+      webError = error
+      queue.push(sse({ error: { message: error.message, type: "upstream_error", code: error.code || "upstream_error" } }))
+    } else {
+      queue.push(chunk({}, "stop"))
+      if (usage) queue.push(sse({ id, object: "chat.completion.chunk", created, model: requestedModel, choices: [], usage }))
+      queue.push("data: [DONE]\n\n")
+    }
+    notify()
+    resolveDone()
+  }
+  timeout = setTimeout(() => finish(Object.assign(new Error("cowork_web 通路等待上游响应超时"), { status: 504 })), 240000)
+  abortHandler = () => finish(Object.assign(new Error("请求已取消"), { status: 499 }))
+  if (signal?.aborted) abortHandler()
+  else signal?.addEventListener?.("abort", abortHandler, { once: true })
+
+  if (!closed) {
+    try {
+      const url = `${base.replace(/^http/, "ws")}${COWORK_WS_PATH}/${sessionId}/sandbox/completions/ws`
+      ws = openCoworkSocket(url, {
+        headers: { Cookie: clientCookie(cookie), Origin: base, "User-Agent": UA },
+      })
+    } catch (error) {
+      finish(Object.assign(new Error(`cowork_web 连接失败：${error?.message || String(error)}`), { status: 502 }))
+    }
+  }
+  if (ws) {
+    ws.onopen = () => {
+      const agentInput = {
+        text: prompt,
+        files: [],
+        file_ids: [],
+        expect_model: requestedModel,
+        refs: [],
+        webpage_edit_selections: [],
+        permission_mode: "default",
+        current_mode: "agent",
+        browser_plugin_enabled: false,
+      }
+      if (typeof body.reasoning_effort === "string" && body.reasoning_effort.trim()) {
+        agentInput.reasoning_effort = body.reasoning_effort.trim()
+      }
+      if (Number.isInteger(body.max_tokens) && body.max_tokens > 0) agentInput.max_tokens = body.max_tokens
+      try {
+        ws.send(JSON.stringify({ event: "user.input", data: { agent_input: agentInput } }))
+      } catch (error) {
+        finish(Object.assign(new Error(`cowork_web 请求发送失败：${error?.message || String(error)}`), { status: 502 }))
+      }
+    }
+    ws.onmessage = (event) => {
+      let frame
+      try { frame = JSON.parse(typeof event.data === "string" ? event.data : String(event.data)) } catch { return }
+      const merged = { ...frame, ...(frame?.data && typeof frame.data === "object" ? frame.data : {}) }
+      if (isAuditError(merged) || frame?.event === "error" || frame?.event === "force.stop") {
+        const error = Object.assign(new Error(textOfPayload(merged) || "cowork_web 上游返回错误"), {
+          status: Number(merged.status) || 502,
+          code: isAuditError(merged) ? "audit_blocked" : "upstream_error",
+        })
+        finish(error)
+        return
+      }
+      if (frame?.event === "component.content") {
+        const delta = String(frame.data?.delta ?? "")
+        if (!delta) return
+        if (frame.data?.type === "c_text") {
+          content += delta
+          queue.push(chunk({ content: delta }))
+        } else if (frame.data?.type === "c_reasoning") {
+          reasoning += delta
+          queue.push(chunk({ reasoning_content: delta }))
+        }
+        notify()
+      }
+      if (frame?.event === "component.end") {
+        usage = coworkUsage(frame) || usage
+        if (frame?.data?.type === "c_reasoning" && typeof frame.data.full_content === "string") {
+          const extra = frame.data.full_content
+          if (extra && extra !== reasoning) {
+            reasoning = extra
+            queue.push(chunk({ reasoning_content: extra }))
+            notify()
+          }
+        }
+      }
+      if (["run.end", "stream.end", "done"].includes(frame?.event)) finish()
+    }
+    ws.onerror = () => finish(Object.assign(new Error("cowork_web WebSocket 连接失败"), { status: 502 }))
+    ws.onclose = () => {
+      if (!closed) finish(Object.assign(new Error("cowork_web 在完成前关闭了连接"), { status: 502 }))
+    }
+  }
+
+  if (stream) {
+    const streamBody = new ReadableStream({
+      async start(controller) {
+        while (!closed || queue.length) {
+          if (!queue.length) await new Promise((resolve) => { wake = resolve })
+          wake = null
+          while (queue.length) controller.enqueue(encoder.encode(queue.shift()))
+        }
+        controller.close()
+      },
+      cancel() { finish() },
+    })
+    return new Response(streamBody, {
+      headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" },
+    })
+  }
+
+  await done
+  if (webError) return errorResponse(webError.message, chatErrorStatus(webError), chatErrorCode(webError))
+  const message = { role: "assistant", content }
+  if (reasoning) message.reasoning_content = reasoning
+  return new Response(JSON.stringify({
+    id, object: "chat.completion", created, model: requestedModel,
+    choices: [{ index: 0, message, finish_reason: "stop" }],
+    ...(usage ? { usage } : {}),
+  }), { headers: { "Content-Type": "application/json" } })
+}
+
 async function agentChat({ cookie, body, stream, requestedModel, signal, errorResponse, clientType, sessionMode }) {
   if (!isChatModelId(requestedModel)) {
     return errorResponse(`WPS 灵犀不支持此聊天模型：${requestedModel}`, 404, "model_not_found")
   }
-  const key = `${identityOf(cookie)}|${requestedModel}|${clientType || ""}|${sessionMode || ""}`
-  const payload = buildAgentBody(body, requestedModel)
+  const requestBody = normalizeResponsesRequest(body)
+  const { key, cache } = chatRunKey(cookie, requestedModel, clientType, sessionMode, requestBody)
+  const payload = buildAgentBody(requestBody, requestedModel)
   const sessionExtra = {
     ...(clientType ? { client_type: clientType } : {}),
     ...(sessionMode ? { session_mode: sessionMode } : {}),
@@ -1359,14 +1722,14 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
     ...(clientType ? { clientType } : {}),
     ...(sessionMode === "expert" ? { currentMode: "expert" } : {}),
   }
-  let run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
+  let run = await ensureRun(cookie, key, requestedModel, lastUserText(requestBody), signal, sessionExtra, runExtra, cache)
   let response
   try {
     response = await requestAgent(cookie, run, payload, signal, clientType)
   } catch (error) {
     if (isAuditError(error) || !looksLikeStaleRun(error.message)) throw error
     runs.delete(key)
-    run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
+    run = await ensureRun(cookie, key, requestedModel, lastUserText(requestBody), signal, sessionExtra, runExtra, cache)
     response = await requestAgent(cookie, run, payload, signal, clientType)
   }
 
@@ -1634,7 +1997,7 @@ async function runTaskConversation(cookie, base, { clientType, sessionMode, curr
     { status, headers: { "Content-Type": "application/json" } },
   )
   try {
-    const key = `${identityOf(cookie)}|${model}|${clientType || ""}|${sessionMode || ""}`
+    const key = `${identityOf(cookie)}|task:${model}|${clientType || ""}|${sessionMode || ""}|${Date.now()}:${++uncachedRunSequence}`
     const sessionExtra = {
       ...(clientType ? { client_type: clientType } : {}),
       ...(sessionMode ? { session_mode: sessionMode } : {}),
@@ -1644,7 +2007,7 @@ async function runTaskConversation(cookie, base, { clientType, sessionMode, curr
       ...(currentMode ? { currentMode } : {}),
     }
     const signal = AbortSignal.timeout(120000)
-    let run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra)
+    let run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra, false)
     await putExecutionStatus(cookie, base, run, "running")
     let response
     try {
@@ -1652,7 +2015,7 @@ async function runTaskConversation(cookie, base, { clientType, sessionMode, curr
     } catch (error) {
       if (!looksLikeStaleRun(error.message)) throw error
       runs.delete(key)
-      run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra)
+      run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra, false)
       response = await requestAgent(cookie, run, buildAgentBody(body, model), signal, clientType)
     }
     const text2 = await response.text().catch(() => "")
@@ -2334,14 +2697,27 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
               }
             } catch {}
 
-            const messages = body.messages || []
             const stream = body.stream !== false
             const requestedModel = wireModel(body.model)
 
-            // 桌面客户端只有一条通路：cowork 会话 → credits/run → agent-runtime。
-            // 网页平面（/api/aigc/v3/assistant/* 的 question 压平与正文工具桥）已移除。
+            // agent-runtime 为主通路；明确的 PermissionDenied 才尝试 cowork_web。
             try {
-              return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
+              if (process.env.MAGPIE_LINGXI_PLANE === "cowork_web") {
+                const requestBody = normalizeResponsesRequest(body)
+                return await coworkWebChat({ cookie, base, body: requestBody, stream, requestedModel, signal, errorResponse })
+              }
+              try {
+                return await agentChat({ cookie, body, stream, requestedModel, signal, errorResponse })
+              } catch (error) {
+                if (!isPermissionDenied(error)) throw error
+                const requestBody = normalizeResponsesRequest(body)
+                const unsupported = coworkWebUnsupportedReason(requestBody)
+                if (unsupported) {
+                  return errorResponse(`${error.message}；${unsupported}，已保留 PermissionDenied 状态`, 403, "PermissionDenied")
+                }
+                console.warn("[magpie-wps-lingxi] agent-runtime 返回 PermissionDenied，文本请求改用 cowork_web 通路")
+                return await coworkWebChat({ cookie, base, body: requestBody, stream, requestedModel, signal, errorResponse })
+              }
             } catch (error) {
               signal?.throwIfAborted()
               return errorResponse(error?.message || String(error), chatErrorStatus(error), chatErrorCode(error))
@@ -2534,6 +2910,15 @@ export const _internal = {
   createGroupChatWith,
   deleteGroupChat,
   agentChat,
+  normalizeResponsesRequest,
+  responsesInputToMessages,
+  conversationThreadId,
+  chatRunKey,
+  coworkWebChat,
+  coworkWebUnsupportedReason,
+  webPromptFromMessages,
+  openCoworkSocket,
+  setCoworkWSFactory(fn) { coworkWSFactory = fn },
   sanitizeSchema,
   normalizeUsage,
   filterTools,

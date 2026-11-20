@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6 — 2026-11-20
+
+- 修复 Issue #21 的会话串线风险：有稳定 `thread_id` 时按账号、模型、客户端、模式和会话分别缓存；没有稳定会话 ID 时不复用 run，避免不同对话共用上游上下文。
+- 兼容 Codex Responses 请求：转换 `input` / `input_text`、图片、函数调用与结果、函数工具、`instructions`、`reasoning.effort` 和 `max_output_tokens`；未知输入类型明确返回 400，不再静默发送空 `messages`。
+- 对明确的 HTTP 403 `PermissionDenied` 尝试 `cowork_web` 回退，支持纯文本和流式响应；工具调用及多模态请求保留 403 并说明回退能力限制。
+- 403 只失效当前被拒绝的 run，不清空其他会话；补充 WebSocket Cookie 握手、会话隔离、Responses 转换和回退行为测试。
+- 新增 `ws` 运行依赖；未验证上游在所有账号、请求阶段都支持 `cowork_web`，需 Issue #22 报告者用 0.3.6 复测。
+
 ## 0.3.5 — 2026-11-16
 
 - 修复 Issue #17：总智点窗口报告最早到期时间和该到期批次的实际余额，保留顶层 `until` 供展示。
