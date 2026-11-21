@@ -1050,7 +1050,7 @@ function isInvalidArgument(error) {
 }
 
 function chatErrorCode(error) {
-  if (error?.code === "invalid_request" || error?.code === "unsupported_request") return error.code
+  if (["invalid_request", "unsupported_request", "tool_call_protocol_error"].includes(error?.code)) return error.code
   if (isAuditError(error)) return "audit_blocked"
   if (isPermissionDenied(error)) return error.upstreamCode
   if (isInvalidArgument(error)) return error.upstreamCode
@@ -1494,7 +1494,16 @@ function chatErrorStatus(error) {
 }
 
 function coworkWebUnsupportedReason(body) {
-  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  const hasToolHistory = messages.some((message) =>
+    message?.role === "tool" || (Array.isArray(message?.tool_calls) && message.tool_calls.length))
+  const choice = body?.tool_choice
+  const hasForcedToolChoice = choice !== undefined && !["auto", "none"].includes(choice)
+  const hasDeclaredTools = choice !== "none" && filterTools(body?.tools).tools.length > 0
+  if ((hasToolHistory || hasForcedToolChoice || hasDeclaredTools) && process.env.MAGPIE_LINGXI_EXPERIMENTAL_TOOL_CALLS !== "1") {
+    return "cowork_web 的文本工具协议尚未经过真实上游闭环验证；默认保留 PermissionDenied。仅可通过 MAGPIE_LINGXI_EXPERIMENTAL_TOOL_CALLS=1 显式启用实验模式"
+  }
+  for (const message of messages) {
     if (Array.isArray(message?.content) && message.content.some((part) =>
       typeof part?.text !== "string" || (part.type && !["text", "input_text", "output_text"].includes(part.type)))) {
       return "cowork_web 降级通路仅支持纯文本消息"
@@ -1512,7 +1521,7 @@ const TOOL_CALL_CLOSE = "</tool_call>"
 const TOOL_RESULT_OPEN = "<tool_result>"
 const TOOL_RESULT_CLOSE = "</tool_result>"
 
-function toolsToPrompt(tools) {
+function toolsToPrompt(tools, toolChoice) {
   if (!Array.isArray(tools) || !tools.length) return ""
   const lines = [
     "你可以通过输出特定格式来调用工具。可用工具列表：",
@@ -1526,12 +1535,16 @@ function toolsToPrompt(tools) {
     if (fn.parameters) lines.push(`参数（JSON Schema）：${JSON.stringify(fn.parameters)}`)
     lines.push("")
   }
+  const namedChoice = toolChoice?.type === "function" ? toolChoice.function?.name : ""
+  if (toolChoice === "required" || namedChoice) {
+    lines.push(namedChoice ? `本轮必须调用工具：${namedChoice}` : "本轮必须调用至少一个已声明的工具。", "")
+  }
   lines.push(
     "调用工具时，请严格按以下格式输出（可以多次调用）：",
     `${TOOL_CALL_OPEN}{"name": "工具名", "arguments": {参数对象}}${TOOL_CALL_CLOSE}`,
     "",
     "工具执行结果会以以下格式出现在对话中：",
-    `${TOOL_RESULT_OPEN}工具返回的内容${TOOL_RESULT_CLOSE}`,
+    `${TOOL_RESULT_OPEN}{"tool_call_id":"调用 ID","name":"工具名","content":"工具返回的内容"}${TOOL_RESULT_CLOSE}`,
     "",
     "请根据工具返回结果继续回答。如果不需要调用工具，直接正常回复即可。",
   )
@@ -1541,16 +1554,48 @@ function toolsToPrompt(tools) {
 function toolCallsToText(toolCalls) {
   return (Array.isArray(toolCalls) ? toolCalls : []).map((tc) => {
     const name = tc?.function?.name || tc?.name || "unknown"
+    const id = typeof tc?.id === "string" ? tc.id : ""
     let args = tc?.function?.arguments ?? tc?.arguments ?? {}
     if (typeof args === "string") {
       try { args = JSON.parse(args) } catch { /* keep as-is */ }
     }
-    return `${TOOL_CALL_OPEN}${JSON.stringify({ name, arguments: args })}${TOOL_CALL_CLOSE}`
+    return `${TOOL_CALL_OPEN}${JSON.stringify({ id, name, arguments: args })}${TOOL_CALL_CLOSE}`
   }).join("\n")
 }
 
-function parseToolCalls(text) {
+function toolValueMatchesSchema(value, schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return true
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) return false
+
+  const type = schema.type
+  if (type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false
+    const properties = schema.properties && typeof schema.properties === "object" ? schema.properties : {}
+    if (Array.isArray(schema.required) && schema.required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) return false
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(value, key) && !toolValueMatchesSchema(value[key], childSchema)) return false
+    }
+    const extraKeys = Object.keys(value).filter((key) => !Object.prototype.hasOwnProperty.call(properties, key))
+    if (schema.additionalProperties === false && extraKeys.length) return false
+    if (schema.additionalProperties && typeof schema.additionalProperties === "object" &&
+        extraKeys.some((key) => !toolValueMatchesSchema(value[key], schema.additionalProperties))) return false
+    return true
+  }
+  if (type === "array") {
+    return Array.isArray(value) && (!schema.items || value.every((item) => toolValueMatchesSchema(item, schema.items)))
+  }
+  if (type === "string") return typeof value === "string"
+  if (type === "boolean") return typeof value === "boolean"
+  if (type === "integer") return Number.isInteger(value)
+  if (type === "number") return typeof value === "number" && Number.isFinite(value)
+  return true
+}
+
+function parseToolCalls(text, tools = []) {
   if (typeof text !== "string" || !text.includes(TOOL_CALL_OPEN)) return { text, calls: [] }
+  const allowedTools = new Map((Array.isArray(tools) ? tools : [])
+    .map((tool) => [tool?.function?.name, tool?.function?.parameters])
+    .filter(([name]) => typeof name === "string" && name.trim()))
   const calls = []
   let remaining = ""
   let pos = 0
@@ -1560,35 +1605,46 @@ function parseToolCalls(text) {
     remaining += text.slice(pos, start)
     const end = text.indexOf(TOOL_CALL_CLOSE, start + TOOL_CALL_OPEN.length)
     if (end === -1) { remaining += text.slice(start); break }
+    const original = text.slice(start, end + TOOL_CALL_CLOSE.length)
     const raw = text.slice(start + TOOL_CALL_OPEN.length, end).trim()
     try {
       const parsed = JSON.parse(raw)
-      if (parsed.name) {
+      const parameters = allowedTools.get(parsed?.name)
+      let args = parsed?.arguments ?? {}
+      if (typeof args === "string") args = JSON.parse(args)
+      const validArgs = args !== null && typeof args === "object" && !Array.isArray(args) &&
+        toolValueMatchesSchema(args, parameters)
+      if (allowedTools.has(parsed?.name) && validArgs) {
         calls.push({
           id: `call_${Date.now()}_${calls.length}`,
           type: "function",
-          function: { name: parsed.name, arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments || {}) },
+          function: { name: parsed.name, arguments: JSON.stringify(args) },
         })
       } else {
-        remaining += text.slice(start, end + TOOL_CALL_CLOSE.length)
+        remaining += original
       }
     } catch {
-      remaining += text.slice(start, end + TOOL_CALL_CLOSE.length)
+      remaining += original
     }
     pos = end + TOOL_CALL_CLOSE.length
   }
   return { text: remaining.trim(), calls }
 }
 
-function webPromptFromMessages(messages, tools) {
+function webPromptFromMessages(messages, tools, toolChoice) {
   const lines = []
-  const toolsPrompt = toolsToPrompt(tools)
+  const activeTools = toolChoice === "none" ? [] : tools
+  const toolsPrompt = toolsToPrompt(activeTools, toolChoice)
   if (toolsPrompt) lines.push(toolsPrompt)
   for (const message of Array.isArray(messages) ? messages : []) {
     const role = String(message?.role || "user")
     if (message?.role === "tool") {
       const content = typeof message?.content === "string" ? message.content : JSON.stringify(message?.content || "")
-      lines.push(`${TOOL_RESULT_OPEN}${content}${TOOL_RESULT_CLOSE}`)
+      lines.push(`${TOOL_RESULT_OPEN}${JSON.stringify({
+        tool_call_id: typeof message?.tool_call_id === "string" ? message.tool_call_id : "",
+        name: typeof message?.name === "string" ? message.name : "",
+        content,
+      })}${TOOL_RESULT_CLOSE}`)
       continue
     }
     const content = typeof message?.content === "string"
@@ -1598,7 +1654,7 @@ function webPromptFromMessages(messages, tools) {
         : ""
     const parts = []
     if (content.trim()) parts.push(content)
-    if (Array.isArray(message?.tool_calls) && message.tool_calls.length) {
+    if (activeTools.length && Array.isArray(message?.tool_calls) && message.tool_calls.length) {
       parts.push(toolCallsToText(message.tool_calls))
     }
     if (parts.length) lines.push(`${role}: ${parts.join("\n")}`)
@@ -1628,8 +1684,17 @@ function coworkUsage(event) {
 async function coworkWebChat({ cookie, base, body, stream, requestedModel, signal, errorResponse }) {
   const unsupported = coworkWebUnsupportedReason(body)
   if (unsupported) return errorResponse(unsupported, 400, "unsupported_request")
-  const { tools } = filterTools(body.tools)
-  const prompt = webPromptFromMessages(body.messages, tools)
+  const { tools: declaredTools } = filterTools(body.tools)
+  const namedChoice = body.tool_choice?.type === "function" ? body.tool_choice.function?.name : ""
+  if (namedChoice && !declaredTools.some((tool) => tool.function.name === namedChoice)) {
+    return errorResponse("tool_choice 指定了未声明的工具", 400, "invalid_request")
+  }
+  const tools = body.tool_choice === "none"
+    ? []
+    : namedChoice
+      ? declaredTools.filter((tool) => tool.function.name === namedChoice)
+      : declaredTools
+  const prompt = webPromptFromMessages(body.messages, tools, body.tool_choice)
   if (!prompt) return errorResponse("没有可发送的消息内容", 400, "invalid_request")
 
   let sessionId
@@ -1656,6 +1721,7 @@ async function coworkWebChat({ cookie, base, body, stream, requestedModel, signa
   let usage = null
   let webError = null
   let closed = false
+  const requireToolCall = body.tool_choice === "required" || Boolean(namedChoice)
   let wake = null
   let ws
   let timeout
@@ -1674,7 +1740,17 @@ async function coworkWebChat({ cookie, base, body, stream, requestedModel, signa
       queue.push(sse({ error: { message: error.message, type: "upstream_error", code: error.code || "upstream_error" } }))
     } else {
       // 解析工具调用：从完整文本中提取 <tool_call> 标记
-      const { text: cleanText, calls } = parseToolCalls(content)
+      const { text: cleanText, calls } = parseToolCalls(content, tools)
+      if (requireToolCall && !calls.length) {
+        const error = Object.assign(new Error("cowork_web 未按要求返回有效工具调用"), { status: 502, code: "tool_call_protocol_error" })
+        webError = error
+        queue.push(sse({ error: { message: error.message, type: "upstream_error", code: error.code } }))
+        notify()
+        resolveDone()
+        return
+      }
+      // 有工具定义时先缓冲文本，直到完整解析后再发出，避免把 <tool_call> 标签泄漏给流客户端。
+      if (tools.length && cleanText) queue.push(chunk({ content: cleanText }))
       if (calls.length) {
         // 有工具调用：发出 tool_calls delta，finish_reason 为 tool_calls
         for (const call of calls) {
@@ -1745,7 +1821,7 @@ async function coworkWebChat({ cookie, base, body, stream, requestedModel, signa
         if (!delta) return
         if (frame.data?.type === "c_text") {
           content += delta
-          queue.push(chunk({ content: delta }))
+          if (!tools.length) queue.push(chunk({ content: delta }))
         } else if (frame.data?.type === "c_reasoning") {
           reasoning += delta
           queue.push(chunk({ reasoning_content: delta }))
@@ -1790,7 +1866,10 @@ async function coworkWebChat({ cookie, base, body, stream, requestedModel, signa
 
   await done
   if (webError) return errorResponse(webError.message, chatErrorStatus(webError), chatErrorCode(webError))
-  const { text: cleanText, calls } = parseToolCalls(content)
+  const { text: cleanText, calls } = parseToolCalls(content, tools)
+  if (requireToolCall && !calls.length) {
+    return errorResponse("cowork_web 未按要求返回有效工具调用", 502, "tool_call_protocol_error")
+  }
   const message = { role: "assistant", content: cleanText }
   if (reasoning) message.reasoning_content = reasoning
   const finishReason = calls.length ? "tool_calls" : "stop"
