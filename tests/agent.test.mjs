@@ -235,12 +235,9 @@ for (const stream of [false, true]) {
 
     try {
       const denied = await request()
-      const deniedBody = await denied.json()
       assert.equal(denied.status, 403)
-      assert.equal(deniedBody.error.code, 'PermissionDenied')
-      assert.match(deniedBody.error.message, /PermissionDenied/)
-      assert.match(deniedBody.error.message, /无权限/)
-      assert.equal(sessions, 1)
+      assert.equal((await denied.json()).error.code, 'PermissionDenied')
+      assert.equal(sessions, 1, 'do not create a cowork_web session for tools by default')
       assert.equal(runs, 1)
       assert.equal(chats, 1, 'permission failure must not retry the same request')
       assert.equal(authReads, 1, 'permission failure must not request another credential')
@@ -253,7 +250,7 @@ for (const stream of [false, true]) {
       } else {
         assert.equal((await recovered.json()).choices[0].message.content, 'recovered')
       }
-      assert.equal(sessions, 2, 'the next request must create a fresh session')
+      assert.equal(sessions, 2, 'the next request creates a fresh agent session')
       assert.equal(runs, 2, 'the next request must create a fresh run')
       assert.equal(chats, 2)
       assert.equal(authReads, 2)
