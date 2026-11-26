@@ -51,7 +51,7 @@ class FakeWebSocket {
   close() {}
 }
 
-async function exercise({ stream = false, plane = 'auto', tools = false, denyAt = 'chat', responseTexts = [], messages, toolChoice, experimentalTools = false } = {}) {
+async function exercise({ stream = false, plane = 'auto', tools = false, denyAt = 'chat', responseTexts = [], messages, toolChoice, experimentalTools = false, closeEarly = false } = {}) {
   const plugin = await WPSLingxiAuthPlugin()
   const loader = await plugin.auth.loader(async () => ({ cookie: COOKIE }))
   const originalFetch = globalThis.fetch
@@ -82,7 +82,8 @@ async function exercise({ stream = false, plane = 'auto', tools = false, denyAt 
     const ws = new FakeWebSocket(url, options)
     queueMicrotask(() => {
       ws.open()
-      ws.complete(replies.shift() ?? '回退成功')
+      if (closeEarly) ws.emit('close', { code: 1006 })
+      else ws.complete(replies.shift() ?? '回退成功')
     })
     return ws
   })
@@ -132,6 +133,20 @@ for (const stream of [false, true]) {
     assert.match(sockets[0].sent[0].data.agent_input.text, /user: 请确认可用/)
     if (stream) assert.match(text, /data: \[DONE\]/)
     else assert.equal(JSON.parse(text).choices[0].message.content, '回退成功')
+  })
+}
+
+for (const stream of [false, true]) {
+  test(`cowork_web early WebSocket close is an error, stream=${stream}`, async () => {
+    const { response, text } = await exercise({ stream, closeEarly: true })
+    if (stream) {
+      assert.equal(response.status, 200)
+      assert.match(text, /"code":"upstream_error"/)
+      assert.doesNotMatch(text, /data: \[DONE\]/)
+    } else {
+      assert.equal(response.status, 502)
+      assert.equal(JSON.parse(text).error.code, 'upstream_error')
+    }
   })
 }
 
