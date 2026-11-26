@@ -25,6 +25,7 @@ const COWORK_WS_PATH = "/api/aioffice/v1/cowork/sessions"
 const CLIENT_TYPE = "lingxi_claw"
 const CLIENT_LANG = "zh-CN"
 const RUN_TTL_MS = 60 * 60 * 1000
+const COOKIE_VALIDATION_LEASE_MS = 360 * 24 * 60 * 60 * 1000
 
 // 上游按 token 限量：实测上限约 150K token（中文填充 ~175 token/KB，混合内容 ~255 token/KB）。
 // 超了不会告诉你「太长」，而是 400「AI服务异常」，整轮失败。320KB 是保守值，留约一半余量。
@@ -2247,6 +2248,36 @@ async function fetchProfile(cookie, base = BASE) {
   }
 }
 
+// Refresh must distinguish a valid WPS cookie from a failed profile lookup.
+// The normal profile helper is intentionally best-effort and cached for UI metadata,
+// so it cannot be used to decide whether auth.refresh succeeded.
+async function fetchProfileForRefresh(cookie, base = BASE) {
+  const response = await fetch(`${base}/api/public/v1/account/profile`, {
+    headers: basicHeaders(cookie, base),
+  })
+  if (response.status === 401 || response.status === 403) {
+    throw Object.assign(new Error(`WPS profile rejected the login: HTTP ${response.status}`), { status: response.status })
+  }
+  if (!response.ok) {
+    throw Object.assign(new Error(`WPS profile request failed: HTTP ${response.status}`), { status: response.status })
+  }
+
+  const json = await response.json()
+  const code = String(json?.code ?? json?.result ?? "").toLowerCase()
+  if (["userunauthorized", "unauthorized", "permissiondenied"].includes(code)) {
+    const status = code === "permissiondenied" ? 403 : 401
+    throw Object.assign(new Error(`WPS profile rejected the login: ${code}`), { status })
+  }
+  if (!json?.data || typeof json.data !== "object") {
+    throw Object.assign(new Error("WPS profile response did not contain account data"), { status: 502 })
+  }
+
+  return {
+    id: String(json.data.id ?? ""),
+    name: String(json.data.name ?? "").trim(),
+  }
+}
+
 // 群聊任务全流程（网页端建群的原样复刻，纯 HTTP/WS）：
 //   1. 建 cowork_web 会话
 //   2. WSS completions/ws 发一次 user.input（服务端据此把会话标记为真实使用）
@@ -2670,6 +2701,9 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
     auth: {
       provider: PROVIDER,
       icon: LINGXI_ICON,
+      // WPS cookies have no refresh-token API. Validate on use instead of
+      // letting the host continuously renew an expired, unrefreshable session.
+      keepAlive: false,
 
       // 1. 每日自动签到：领前领后读余额（上游重复领取是「幂等假成功」），
       //    顺手把上游已判 claimable 的一次性任务领回（incomplete 的不碰）。
@@ -2737,10 +2771,19 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
       // refresh 的返回值会合并进账号记录，这里借它把旧记录改成 wps-<uid> 并补上昵称。
       async refresh(auth) {
         const cookie = resolveCookie(auth)
-        if (!cookie) return {}
+        if (!cookie) return { signIn: "expired", message: "未检测到有效 WPS 登录凭证" }
         const base = resolveBase(auth)
         const sid = extractSid(cookie)
-        const profile = await fetchProfile(cookie, base).catch(() => ({}))
+        let profile
+        try {
+          profile = await fetchProfileForRefresh(cookie, base)
+        } catch (error) {
+          if (error?.status === 401 || error?.status === 403) {
+            return { signIn: "expired", message: "WPS 登录态已失效，请重新登录" }
+          }
+          // Let Magpie apply its renewal backoff for transient failures.
+          throw error
+        }
         const uid = auth.metadata?.uid || extractUid(cookie) || profile.id || ""
         const accountId = uid ? `wps-${uid}` : sid ? `wps-${sid.slice(-8)}` : undefined
         const metadata = { ...(auth.metadata || {}) }
@@ -2748,7 +2791,10 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
         if (uid) metadata.uid = uid
         if (profile.name) metadata.name = profile.name
         if (accountId) metadata.accountId = accountId
-        const out = { metadata }
+        // A successful, uncached profile request validates the cookie. Use the
+        // same 360-day local lease as login; an upstream 401/403 remains the
+        // authoritative signal that the cookie has expired.
+        const out = { expires: Date.now() + COOKIE_VALIDATION_LEASE_MS, metadata }
         if (accountId && auth.accountId !== accountId) out.accountId = accountId
         return out
       },
